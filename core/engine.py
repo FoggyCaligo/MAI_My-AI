@@ -27,8 +27,9 @@ class CognitiveEngine:
 
     Top view:
       each source Unit is a logical cell containing observed next-unit addresses.
-      For the currently active sequence, the number of matching CellElements is
-      the density itself. No separate semantic score is required.
+      For the currently active sequence, unrelated historical sheets are filtered
+      out by sentence/pass/position continuity first. The number of surviving
+      CellElements is the density itself.
 
     Lazy projection:
       higher-depth Units live independently from the observations that first
@@ -49,10 +50,6 @@ class CognitiveEngine:
 
     def close(self) -> None:
         self.db.close()
-
-    # ------------------------------------------------------------------ #
-    # Unit helpers                                                         #
-    # ------------------------------------------------------------------ #
 
     def get_unit_depth(self, unit_id: str) -> int:
         row = self.conn.execute(
@@ -113,8 +110,6 @@ class CognitiveEngine:
                 if self._composition_exists(unit_id, child_unit_ids):
                     return unit_id
 
-        # Same surface content at the same depth may still be a different Unit
-        # when its composition lineage is different.
         unit_id = f"unit-d{depth}-{uuid.uuid4().hex[:8]}"
         self.conn.execute(
             "INSERT INTO units (unit_id, depth, content, support_count) VALUES (?, ?, ?, 1)",
@@ -124,10 +119,6 @@ class CognitiveEngine:
             self._record_composition(unit_id, child_unit_ids)
         self.conn.commit()
         return unit_id
-
-    # ------------------------------------------------------------------ #
-    # Cell storage / raw top-view density                                  #
-    # ------------------------------------------------------------------ #
 
     def _cell_targets(self, source_unit_id: str) -> dict[str, dict[LayerKey, float]]:
         cached = self._cell_cache.get(source_unit_id)
@@ -161,11 +152,44 @@ class CognitiveEngine:
         next_unit_id: str,
         exclude_sentence_id: str | None = None,
     ) -> int:
-        """Return the literal number of matching observed CellElements."""
         paths = self._cell_targets(source_unit_id).get(next_unit_id, {})
         if exclude_sentence_id is None:
             return len(paths)
         return sum(1 for key in paths if key[0] != exclude_sentence_id)
+
+    def _matching_paths(
+        self,
+        source_unit_id: str,
+        next_unit_id: str,
+        exclude_sentence_id: str | None = None,
+    ) -> dict[LayerKey, float]:
+        paths = self._cell_targets(source_unit_id).get(next_unit_id, {})
+        if exclude_sentence_id is None:
+            return dict(paths)
+        return {
+            key: opacity
+            for key, opacity in paths.items()
+            if key[0] != exclude_sentence_id
+        }
+
+    def _advance_paths(
+        self,
+        survivors: dict[LayerKey, float],
+        source_unit_id: str,
+        next_unit_id: str,
+    ) -> dict[LayerKey, float]:
+        """Keep only the same historical sheet at the immediately next position."""
+        if not survivors:
+            return {}
+
+        next_paths = self._cell_targets(source_unit_id).get(next_unit_id, {})
+        advanced: dict[LayerKey, float] = {}
+        for (sentence_id, stored_pass_id, position), opacity in survivors.items():
+            wanted = (sentence_id, stored_pass_id, position + 1)
+            next_opacity = next_paths.get(wanted)
+            if next_opacity is not None:
+                advanced[wanted] = min(opacity, next_opacity)
+        return advanced
 
     def _record_cell_elements(
         self,
@@ -197,10 +221,6 @@ class CognitiveEngine:
             cached = self._cell_cache.get(source)
             if cached is not None:
                 cached.setdefault(next_id, {})[(sid, stored_pass_id, position)] = 1.0
-
-    # ------------------------------------------------------------------ #
-    # Lazy projection from existing composition structure                 #
-    # ------------------------------------------------------------------ #
 
     def _composition_candidates(self, first_child_id: str) -> list[CompositionCandidate]:
         cached = self._composition_cache.get(first_child_id)
@@ -238,11 +258,6 @@ class CognitiveEngine:
         return candidates
 
     def _project_existing_units(self, unit_ids: list[str]) -> list[str]:
-        """Overlay already-known higher Units on an active sequence.
-
-        This is read-only with respect to observations: old sentence layers are
-        not rewritten. The returned list is only the current active view.
-        """
         if len(unit_ids) <= 1:
             return list(unit_ids)
 
@@ -301,7 +316,6 @@ class CognitiveEngine:
         return result
 
     def activate_sentence(self, sentence_id: str) -> dict[str, Any]:
-        """Read-only lazy side-view projection for a stored sentence."""
         base_ids = self._load_observed_layer(sentence_id, 0)
         projection_layers = self._project_until_stable(base_ids)
 
@@ -327,46 +341,59 @@ class CognitiveEngine:
 
         return {"sentence_id": sentence_id, "layers": layers}
 
-    # ------------------------------------------------------------------ #
-    # Density-driven discovery                                             #
-    # ------------------------------------------------------------------ #
-
     def _discover_from_density(
         self,
         unit_ids: list[str],
         current_sentence_id: str,
     ) -> tuple[list[str], list[int]]:
-        """Create new Units directly from visible overlap in the active layer."""
+        """Filter historical sheets first, then use survivor count as density."""
         if len(unit_ids) <= 1:
             return list(unit_ids), []
 
-        densities = [
+        edge_densities = [
             self._edge_density(unit_ids[i], unit_ids[i + 1], current_sentence_id)
             for i in range(len(unit_ids) - 1)
         ]
 
         result: list[str] = []
-        index = 0
-        while index < len(unit_ids):
-            if index >= len(densities) or densities[index] == 0:
-                result.append(unit_ids[index])
-                index += 1
+        start = 0
+        while start < len(unit_ids):
+            if start == len(unit_ids) - 1:
+                result.append(unit_ids[start])
+                break
+
+            survivors = self._matching_paths(
+                unit_ids[start], unit_ids[start + 1], current_sentence_id
+            )
+            if not survivors:
+                result.append(unit_ids[start])
+                start += 1
                 continue
 
-            end = index + 1
-            while end < len(densities) and densities[end] > 0:
-                end += 1
+            best_end = start + 2
+            best_density = len(survivors)
+            cursor = start + 1
+            while cursor < len(unit_ids) - 1:
+                survivors = self._advance_paths(
+                    survivors, unit_ids[cursor], unit_ids[cursor + 1]
+                )
+                if not survivors:
+                    break
+                end = cursor + 2
+                density = len(survivors)
+                if density > best_density or (
+                    density == best_density and end > best_end
+                ):
+                    best_density = density
+                    best_end = end
+                cursor += 1
 
-            child_ids = unit_ids[index : end + 1]
+            child_ids = unit_ids[start:best_end]
             content = "".join(self.get_unit_content(uid) for uid in child_ids)
             result.append(self.get_or_create_unit(content, child_ids))
-            index = end + 1
+            start = best_end
 
-        return result, densities
-
-    # ------------------------------------------------------------------ #
-    # Feedback                                                             #
-    # ------------------------------------------------------------------ #
+        return result, edge_densities
 
     def apply_feedback(self, sentence_id: str, score: float) -> float:
         clamped = max(0.0, min(100.0, float(score)))
@@ -397,10 +424,6 @@ class CognitiveEngine:
         self.conn.commit()
         self._cell_cache.clear()
         return new_avg
-
-    # ------------------------------------------------------------------ #
-    # Main processing loop                                                 #
-    # ------------------------------------------------------------------ #
 
     def process_sentence(self, raw_text: str) -> dict[str, Any]:
         normalized = str(raw_text).strip()
@@ -459,10 +482,6 @@ class CognitiveEngine:
             "pass_results": pass_results,
             "thought_results": thought_results,
         }
-
-    # ------------------------------------------------------------------ #
-    # Side-view thinking                                                   #
-    # ------------------------------------------------------------------ #
 
     def _think_side_view(
         self,
