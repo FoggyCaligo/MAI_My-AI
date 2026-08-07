@@ -24,11 +24,13 @@ class CellTopViewTests(unittest.TestCase):
         second = self.engine.process_sentence("눈꽃")
         self.assertEqual(second["word_segments"], ["눈꽃"])
         self.assertEqual(second["pass_results"][0]["depths"], [1])
+        self.assertEqual(second["pass_results"][0]["top_view_densities"], [1])
 
     def test_diverging_next_address_does_not_merge(self) -> None:
         self.engine.process_sentence("눈꽃")
         result = self.engine.process_sentence("눈이")
         self.assertEqual(result["word_segments"], ["눈", "이"])
+        self.assertEqual(result["pass_results"][0]["top_view_densities"], [0])
 
     def test_cell_elements_keep_side_view_coordinates(self) -> None:
         result = self.engine.process_sentence("눈꽃")
@@ -49,18 +51,58 @@ class CellTopViewTests(unittest.TestCase):
         self.assertEqual(int(rows[0]["pass_id"]), 0)
         self.assertEqual(int(rows[0]["position"]), 0)
 
-    def test_top_view_is_not_locked_to_current_pass_number(self) -> None:
-        # Build a depth-1 Unit and store a pass-1 connection to a remaining Unit.
-        self.engine.process_sentence("눈꽃A")
-        self.engine.process_sentence("눈꽃B")
-        third = self.engine.process_sentence("눈꽃C")
-        self.assertEqual(third["word_segments"][0], "눈꽃")
+    def test_density_counts_all_matching_structural_observations_across_passes(self) -> None:
+        self.engine.process_sentence("AB")
+        self.engine.process_sentence("AB")
 
-        # Repeating the same sequence should be able to use the historical
-        # pass-1 path even though top-view matching itself has no current-pass filter.
-        fourth = self.engine.process_sentence("눈꽃C")
-        self.assertEqual(fourth["word_segments"][0], "눈꽃")
-        self.assertGreaterEqual(len(fourth["pass_results"]), 2)
+        a_id = self.engine.conn.execute(
+            "SELECT unit_id FROM units WHERE depth = 0 AND content = 'A'"
+        ).fetchone()["unit_id"]
+        b_id = self.engine.conn.execute(
+            "SELECT unit_id FROM units WHERE depth = 0 AND content = 'B'"
+        ).fetchone()["unit_id"]
+
+        self.assertEqual(self.engine._edge_density(str(a_id), str(b_id)), 2)
+
+    def test_old_sentence_is_lazily_projected_with_new_units_without_rewrite(self) -> None:
+        original = self.engine.process_sentence("눈꽃의계절")
+        original_id = original["sentence_id"]
+        self.assertEqual(original["word_segments"], ["눈", "꽃", "의", "계", "절"])
+
+        before_rows = self.engine.conn.execute(
+            "SELECT COUNT(*) AS n FROM cell_elements WHERE sentence_id = ?",
+            (original_id,),
+        ).fetchone()["n"]
+
+        snow = self.engine.process_sentence("눈꽃이 흩날린다")
+        self.assertEqual(snow["word_segments"][0], "눈꽃")
+
+        season = self.engine.process_sentence("독서의 계절")
+        self.assertIn("계절", season["word_segments"])
+
+        active = self.engine.activate_sentence(original_id)
+        self.assertGreaterEqual(len(active["layers"]), 2)
+        self.assertEqual(active["layers"][-1]["contents"], ["눈꽃", "의", "계절"])
+
+        after_rows = self.engine.conn.execute(
+            "SELECT COUNT(*) AS n FROM cell_elements WHERE sentence_id = ?",
+            (original_id,),
+        ).fetchone()["n"]
+        self.assertEqual(before_rows, after_rows)
+
+    def test_activation_is_read_only(self) -> None:
+        original = self.engine.process_sentence("ABCD")
+        sentence_id = original["sentence_id"]
+
+        before_units = self.engine.conn.execute("SELECT COUNT(*) AS n FROM units").fetchone()["n"]
+        before_cells = self.engine.conn.execute("SELECT COUNT(*) AS n FROM cell_elements").fetchone()["n"]
+
+        self.engine.activate_sentence(sentence_id)
+
+        after_units = self.engine.conn.execute("SELECT COUNT(*) AS n FROM units").fetchone()["n"]
+        after_cells = self.engine.conn.execute("SELECT COUNT(*) AS n FROM cell_elements").fetchone()["n"]
+        self.assertEqual(before_units, after_units)
+        self.assertEqual(before_cells, after_cells)
 
 
 if __name__ == "__main__":
