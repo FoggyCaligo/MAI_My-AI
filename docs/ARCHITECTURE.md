@@ -4,15 +4,17 @@
 
 MAI uses one recursive Unit system rather than hard-coded semantic layers.
 
-The storage and recognition model follows the cellophane metaphor directly:
+The storage model and the recognition model are intentionally separated:
 
 ```text
-observation
-  -> store address-like CellElements in logical Unit cells
-  -> overlay the current sequence on those cells
-  -> discard historical paths that point somewhere else
-  -> count the surviving layers from the top view
-  -> materialize the selected Unit
+persistent observation
+  -> store only what was actually observed at that time
+  -> never retroactively rewrite inactive past sentences
+
+current activation
+  -> overlay currently known Units on the active area
+  -> read literal CellElement overlap counts as density
+  -> discover new Units only from the active structure
   -> feed the resulting mixed-depth Unit sequence back in
   -> repeat
 ```
@@ -29,9 +31,9 @@ Unmerged Units keep their original depth, so mixed-depth sequences are valid.
 
 ## 2. Logical Cell / CellElement Storage
 
-SQLite is the persistent representation of a conceptual 3D cellophane structure.
+SQLite is the persistent representation of the conceptual cellophane structure.
 
-The floor consists of Units. Each Unit acts as a logical **cell**. A cell can contain many stacked elements from different observed sentences.
+Each Unit acts as a logical cell. A cell contains many observed elements from different sentence sheets.
 
 Each `cell_elements` row contains:
 
@@ -39,13 +41,13 @@ Each `cell_elements` row contains:
 source_unit_id   : the current cell
 next_unit_id     : address-like direct pointer to the next Unit
 sentence_id      : unique id of the original sentence / cellophane sheet
-position         : horizontal position inside that stored layer
-pass_id          : vertical derivation pass in that sentence
+position         : horizontal position inside that observed layer
+pass_id          : recursive pass coordinate in that observation
 link_depth       : max depth of the two connected Units
-opacity          : feedback-adjustable visibility weight
+opacity          : feedback-adjustable weight used by higher-level thinking
 ```
 
-Therefore a logical cell may look conceptually like:
+Conceptually:
 
 ```text
 cell [눈]
@@ -55,60 +57,116 @@ cell [눈]
   - ...
 ```
 
-The database schema also keeps:
+The database keeps:
 
-- `units`: persistent Units and their actual depth
-- `compositions`: parent -> positioned children, used to reconstruct derivation
-- `cell_elements`: stacked address/path elements inside logical cells
+- `units`: persistent Units and their structural depth
+- `compositions`: parent -> positioned children
+- `cell_elements`: observed address elements inside logical cells
 
-Older `unit_links` databases are copied into `cell_elements` on migration. The legacy table may remain physically present, but the engine no longer writes to or searches it.
-
----
-
-## 3. Top View: Cellophane Overlap
-
-Top-view recognition does not repeatedly query every candidate span from SQLite.
-
-For a source Unit, the engine lazily loads its logical cell once and caches it in memory as:
-
-```text
-source_unit_id
-  -> next_unit_id
-      -> (sentence_id, stored_pass_id, position)
-```
-
-When the current sentence follows:
-
-```text
-A -> B -> C
-```
-
-MAI performs:
-
-```text
-cell[A]: keep only elements whose next address is B
-cell[B]: among those surviving layers, keep only the same
-         sentence_id + stored_pass_id at position + 1 whose next address is C
-...
-```
-
-A historical path that diverges is removed from that candidate path only. The same sentence may still participate from another starting offset.
-
-The density of a candidate span is simply the number of surviving historical layers. At each current start position:
-
-1. choose the span with the largest surviving-layer count;
-2. when counts are equal, choose the longer span;
-3. if no historical layer survives, keep the original Unit unchanged.
-
-Only the finally selected span is written as a new Unit. Candidate spans are never materialized merely for scoring.
-
-`pass_id` is deliberately **not** required to equal the current processing pass. A structure learned in historical pass 1 can support the same Unit sequence observed in current pass 2. The stored pass id remains part of the historical path key so a layer can still be reconstructed correctly from the side.
+Older `unit_links` data can be migrated into `cell_elements`. The engine no longer needs legacy `unit_links` for recognition.
 
 ---
 
-## 4. Recursive Mixed-Depth Layering
+## 3. Density Is the Structure Itself
 
-Processing starts with character Units (`depth 0`).
+MAI does not need a separate semantic score to decide how dark a top-view area is.
+
+For the currently active sequence, the density of an adjacency is simply:
+
+```text
+density(A -> B) = number of CellElements in cell[A] whose next address is B
+```
+
+Example:
+
+```text
+눈 -> 꽃 : 17 elements
+꽃 -> 의 : 3 elements
+의 -> 계 : 2 elements
+계 -> 절 : 15 elements
+```
+
+Those counts are already the top-view darkness. The engine does not convert them into a second artificial confidence value.
+
+The cache exists only to avoid rereading the same logical cell repeatedly. The persistent source of truth remains SQLite.
+
+`pass_id` is not used as a current-pass equality filter. If the exact same Unit adjacency was observed at different recursive passes, it is still the same structural adjacency from the top view. The stored `pass_id` remains available to reconstruct the historical layer from the side.
+
+---
+
+## 4. Lazy Projection: Past Observations Are Not Rewritten
+
+New Units do **not** trigger a database-wide reprocessing of old sentences.
+
+Suppose the first observation is:
+
+```text
+S1: 눈 / 꽃 / 의 / 계 / 절
+```
+
+Later observations may independently create:
+
+```text
+[눈꽃] d1 = [눈]d0 + [꽃]d0
+[계절] d1 = [계]d0 + [절]d0
+```
+
+Those Units can live elsewhere in the graph. S1 does not need to be modified.
+
+When S1 becomes active again, MAI overlays currently existing compositions on the active base sequence:
+
+```text
+stored S1 remains:
+[눈] [꽃] [의] [계] [절]
+
+current active projection:
+[눈꽃] [의] [계절]
+```
+
+This is a **read-only lazy projection**. Inactive historical areas are not updated merely because new knowledge appeared elsewhere.
+
+The implementation exposes this distinction explicitly:
+
+```text
+process_sentence(...)
+  -> a new observation; may write new CellElements / Units
+
+activate_sentence(sentence_id)
+  -> read-only projection of a stored observation using currently known Units
+  -> does not rewrite that sentence
+  -> does not create new observation rows
+```
+
+This keeps growth practical when the database becomes large.
+
+---
+
+## 5. Existing Units Are Independent Objects
+
+A Unit does not have to be physically stored inside every sentence where its children could match.
+
+For example:
+
+```text
+Unit U37: [눈꽃] d1
+children: [눈]d0, [꽃]d0
+```
+
+may have been learned from some other observation. When an active area contains the child sequence `[눈][꽃]`, U37 can be projected onto that area because its composition already expresses that structure.
+
+Therefore:
+
+```text
+observation ownership != Unit identity
+```
+
+A sentence records what was observed. A Unit records a reusable structure.
+
+---
+
+## 6. Recursive Mixed-Depth Layering
+
+Processing begins with character Units (`depth 0`). Existing higher Units may first be projected onto the active sequence, and literal CellElement density can then reveal new repeated structure.
 
 Example:
 
@@ -117,66 +175,94 @@ Example:
   -> [눈꽃]d1
 
 [눈꽃]d1 + [의]d0 + [계절]d1
-  -> [눈꽃의 계절]d2
+  -> [눈꽃의계절]d2
 ```
 
-The lower Units are not replaced or deleted. `[눈]`, `[눈꽃]`, and `[눈꽃의 계절]` can coexist permanently.
+The lower Units are not replaced or deleted. `[눈]`, `[눈꽃]`, and `[눈꽃의계절]` may all coexist.
 
-`pass_id` and `unit.depth` are independent:
+`pass_id` and `unit.depth` remain independent:
 
-- `pass_id`: which recursive iteration produced/observed a sequence in one sentence
-- `unit.depth`: structural composition depth calculated from actual children
+- `pass_id`: which recursive iteration observed a sequence in one sentence
+- `unit.depth`: structural depth calculated from actual children
 
-The next pass receives the selected Unit IDs exactly as they are, preserving mixed depths.
+A newly created Unit always uses:
+
+```text
+max(child.depth) + 1
+```
+
+so recursive depth can continue growing without a fixed semantic ceiling.
 
 ---
 
-## 5. Side View Remains Intact
+## 7. Side View Remains Intact
 
-The top-view optimization does not remove the side view.
-
-A stored layer can be reconstructed with:
+Persistent side-view coordinates remain:
 
 ```text
 sentence_id + pass_id + position
 ```
 
-and the vertical composition of a Unit can be reconstructed through `compositions`.
+and vertical Unit structure remains available through `compositions`.
 
 Conceptually:
 
 ```text
-                  [눈꽃의 계절] d2
+                  [눈꽃의계절] d2
                     /    |    \
                [눈꽃]d1 [의]d0 [계절]d1
                  /  \              /  \
               [눈]d0 [꽃]d0      [계]d0 [절]d0
 ```
 
-Thus the same persistent data supports two independent views:
+There are therefore two related side views:
+
+1. **historical side view** — what was actually observed and stored at that time;
+2. **active side view** — what currently known Units reveal when projected over the active historical base.
+
+The second can become richer over time without modifying the first.
+
+---
+
+## 8. Example Learning Sequence
+
+Given these observations:
 
 ```text
-Top view  : follow next_unit_id and count surviving stacked elements
-Side view : follow sentence/pass/position coordinates and compositions
+1. 눈꽃의계절
+2. 눈꽃이 흩날린다
+3. 독서의 계절
 ```
 
-`pass_id` is a side-view coordinate, not a top-view equality constraint.
+The intended behavior is:
+
+```text
+Observation 1
+  -> initially remains character-level where no overlap exists
+
+Observation 2
+  -> the previously observed 눈 -> 꽃 address overlaps
+  -> [눈꽃] can be created as a new higher-depth Unit
+
+Observation 3
+  -> the previously observed 계 -> 절 address overlaps
+  -> [계절] can be created as a new higher-depth Unit
+
+Later activation of Observation 1
+  -> no retroactive DB rewrite
+  -> existing compositions are overlaid lazily
+  -> active view can appear as [눈꽃] / [의] / [계절]
+```
+
+This is the intended distinction between persistent observation and current interpretation.
 
 ---
 
-## 6. Side-View Thinking
+## 9. Side-View Thinking and Feedback
 
-After recursive layering terminates, thinking uses current Units whose actual `unit.depth >= 2`.
+After recursive layering terminates, Think can use current Units whose actual `unit.depth >= 2` to find intersecting historical sentence layers.
 
-MAI finds other sentence layers intersecting those Units in `cell_elements`, then retrieves higher-depth Units from those intersecting layers. `opacity` remains available as a feedback-adjustable weight for thought prominence.
-
-The current implementation still contains a lightweight Korean functional-particle filter. This is an application heuristic around the current experimental Think implementation, not a definition of Unit depth.
-
----
-
-## 7. Feedback
-
-User feedback is stored as opacity adjustment on `cell_elements` at `link_depth >= 2`.
+`opacity` remains a feedback-adjustable weight for higher-level thinking:
 
 ```text
 50  -> x1.00
@@ -184,16 +270,19 @@ User feedback is stored as opacity adjustment on `cell_elements` at `link_depth 
 0   -> x0.75
 ```
 
-Top-view structural support is based on the number of surviving CellElements. Opacity does not redefine whether the historical path exists; it affects visibility/weight in higher-level thinking.
+Opacity does not redefine top-view structural density. Structural density remains the literal count of matching CellElements.
+
+The current Think implementation still contains a lightweight Korean functional-particle filter. That heuristic belongs to the experimental Think layer and is not part of Unit identity or depth.
 
 ---
 
-## 8. Core vs Application Boundary
+## 10. Core vs Application Boundary
 
 ```text
 core/
   db.py       : SQLite Unit/composition/CellElement persistence and migration
-  engine.py   : cached top-view overlap, recursive layering, side-view thinking, feedback
+  engine.py   : literal density, lazy active projection, recursive layering,
+                side-view thinking, feedback
   __init__.py : core interface
 
 app/
