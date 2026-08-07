@@ -80,12 +80,12 @@ class Database:
         return row is not None
 
     def _migrate_legacy_unit_links(self) -> None:
-        """Copy old unit_links rows once into cell_elements when upgrading an existing DB."""
-        if not self._table_exists("unit_links"):
-            return
+        """Copy legacy unit_links rows into cell_elements without duplicating observations.
 
-        existing = self.conn.execute("SELECT COUNT(*) AS c FROM cell_elements").fetchone()
-        if existing and int(existing["c"]) > 0:
+        Migration is row-idempotent rather than all-or-nothing: if an earlier run copied
+        only part of a legacy table, the missing rows can still be imported later.
+        """
+        if not self._table_exists("unit_links"):
             return
 
         columns = {
@@ -110,14 +110,23 @@ class Database:
             INSERT INTO cell_elements
               (source_unit_id, next_unit_id, sentence_id, position, pass_id, link_depth, opacity)
             SELECT
-              source_unit_id,
-              target_unit_id,
-              sentence_id,
-              position,
+              ul.source_unit_id,
+              ul.target_unit_id,
+              ul.sentence_id,
+              ul.position,
               {pass_expr},
               {depth_expr},
               {opacity_expr}
-            FROM unit_links
+            FROM unit_links AS ul
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM cell_elements AS ce
+                WHERE ce.source_unit_id = ul.source_unit_id
+                  AND ce.next_unit_id = ul.target_unit_id
+                  AND ce.sentence_id = ul.sentence_id
+                  AND ce.position = ul.position
+                  AND ce.pass_id = {pass_expr}
+            )
             """
         )
 
