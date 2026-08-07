@@ -12,6 +12,7 @@ Each cell contains observation elements that say:
 from this Unit
 follow this next Unit address
 inside this sentence
+inside this recursive pass
 at this position
 ```
 
@@ -28,18 +29,18 @@ CellElement
 - opacity
 ```
 
-`next_unit_id` is the practical equivalent of a directly followable address. `sentence_id` and `position` preserve the original observation path.
+`next_unit_id` is the practical equivalent of a directly followable address. `sentence_id + pass_id + position` preserves one historical observation path.
 
 ## 2. Persistent table, in-memory 3D view
 
-SQLite remains the persistent representation, but the overlap algorithm should not repeatedly query every candidate edge.
+SQLite remains the persistent representation, but the overlap algorithm does not repeatedly query every candidate edge.
 
 For the Units that occur in the current input, MAI loads their cells once and builds an in-memory index:
 
 ```text
 source Unit
   -> next Unit
-      -> (sentence_id, position)
+      -> (sentence_id, historical_pass_id, position)
           -> opacity
 ```
 
@@ -53,36 +54,37 @@ Suppose the current path is:
 A -> B -> C -> D
 ```
 
-At `A -> B`, all historical sentence layers containing that exact address transition are initially visible.
+At `A -> B`, all historical layers containing that exact address transition are initially visible.
 
-At the next step, a layer survives only if the same `sentence_id` also contains `B -> C` at the immediately following position.
+At the next step, a layer survives only if the same historical `(sentence_id, pass_id)` also contains `B -> C` at the immediately following position.
 
 The same rule repeats for `C -> D`.
 
-Therefore two unrelated observations cannot be stitched into a fake path:
+Therefore unrelated observations cannot be stitched into a fake path:
 
 ```text
-sentence X: A -> B
-sentence Y: B -> C
+sentence X / pass 0: A -> B
+sentence Y / pass 0: B -> C
 ```
 
-does not imply:
+and even different recursive passes of the same sentence cannot be stitched accidentally:
 
 ```text
-A -> B -> C
+sentence X / pass 0: A -> B
+sentence X / pass 3: B -> C
 ```
 
-because the `sentence_id` lineage is different.
+Neither case implies one historical path `A -> B -> C`.
 
 ## 4. What the top view counts
 
-When opacity is `1.0`, every surviving sentence layer contributes one visible layer for every traversed address cell.
+When opacity is `1.0`, every surviving historical layer contributes one visible layer for every traversed address cell.
 
 For a candidate span:
 
 ```text
 visible cell count
-= surviving sentence layers * traversed edges
+= surviving historical layers * traversed edges
 ```
 
 Opacity feedback turns this into a weighted visible-cell count without changing the underlying path identity.
@@ -91,13 +93,15 @@ This replaces repeated SQL span matching with:
 
 ```text
 load relevant cells once
--> keep matching sentence paths alive in memory
+-> keep matching historical paths alive in memory
 -> count the cells that remain visible
 ```
 
 ## 5. Pass and depth remain separate
 
-`pass_id` records when an observation was produced during recursive processing. It is not part of structural equality for top-view matching.
+The current processing pass does not need to equal the historical pass in which a matching structure was observed. `pass_id` is not a semantic depth or Unit identity.
+
+However, once MAI starts following one historical layer, that layer keeps the same historical `pass_id` until the path ends. This prevents edges from different recursive representations of one sentence from being mixed together.
 
 `Unit.depth` still follows the recursive composition rule:
 
