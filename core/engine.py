@@ -8,7 +8,7 @@ from typing import Any
 from .db import Database
 
 
-CellKey = tuple[str, int]  # (sentence_id, position)
+CellKey = tuple[str, int, int]  # (sentence_id, historical_pass_id, position)
 CellIndex = dict[str, dict[str, dict[CellKey, float]]]
 
 
@@ -38,8 +38,9 @@ class CognitiveEngine:
           -> position
           -> opacity
 
-    pass_id is observation metadata only. Unit identity and overlap matching do not
-    require the same pass_id.
+    Current-pass equality is never required for overlap matching. Historical
+    sentence paths still preserve their own pass_id so edges from different
+    historical passes cannot be stitched together accidentally.
     """
 
     def __init__(self, db_path: str | Path | None = None) -> None:
@@ -227,9 +228,9 @@ class CognitiveEngine:
         """
         Load all relevant cells in one query.
 
-        Multiple observations of the same edge at the same sentence position but at
-        different recursive passes represent the same sentence layer for top-view
-        matching, so they are collapsed with MAX(opacity).
+        Current pass_id is not used as a filter. A historical path keeps its own
+        (sentence_id, pass_id, position) lineage so different passes from the same
+        sentence cannot be stitched together accidentally.
         """
         if not source_unit_ids:
             return {}
@@ -247,6 +248,7 @@ class CognitiveEngine:
                 source_unit_id,
                 next_unit_id,
                 sentence_id,
+                pass_id,
                 position,
                 MAX(opacity) AS opacity
             FROM cell_elements
@@ -256,6 +258,7 @@ class CognitiveEngine:
                 source_unit_id,
                 next_unit_id,
                 sentence_id,
+                pass_id,
                 position
             """,
             params,
@@ -265,7 +268,11 @@ class CognitiveEngine:
         for row in rows:
             source_id = str(row["source_unit_id"])
             next_id = str(row["next_unit_id"])
-            key = (str(row["sentence_id"]), int(row["position"]))
+            key = (
+                str(row["sentence_id"]),
+                int(row["pass_id"]),
+                int(row["position"]),
+            )
             opacity = float(row["opacity"])
             index.setdefault(source_id, {}).setdefault(next_id, {})[key] = opacity
         return index
@@ -280,7 +287,7 @@ class CognitiveEngine:
 
         For every start position, paths survive only while:
           - the next-unit address matches, and
-          - the same sentence_id continues at position + 1.
+          - the same historical (sentence_id, pass_id) continues at position + 1.
 
         The result for (start, end) is:
           (weighted visible-layer count, raw surviving-layer count)
@@ -313,8 +320,16 @@ class CognitiveEngine:
                     break
 
                 advanced: dict[CellKey, float] = {}
-                for (sentence_id, previous_position), path_opacity in active.items():
-                    next_key = (sentence_id, previous_position + 1)
+                for (
+                    sentence_id,
+                    historical_pass_id,
+                    previous_position,
+                ), path_opacity in active.items():
+                    next_key = (
+                        sentence_id,
+                        historical_pass_id,
+                        previous_position + 1,
+                    )
                     next_opacity = next_edge.get(next_key)
                     if next_opacity is None:
                         continue
@@ -436,7 +451,7 @@ class CognitiveEngine:
         Store one sentence layer.
 
         next_unit_id is the directly followable "address" inside each cell.
-        sentence_id + position reconstruct the observation order.
+        sentence_id + pass_id + position reconstruct one historical layer.
         """
         if len(unit_ids) < 2:
             return
