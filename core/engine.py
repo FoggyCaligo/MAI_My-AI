@@ -8,6 +8,7 @@ from typing import Any
 from .db import Database
 
 LayerKey = tuple[str, int, int]  # (sentence_id, stored_pass_id, position)
+CompositionCandidate = tuple[str, tuple[str, ...], int]  # parent_id, children, depth
 
 
 @dataclass(slots=True)
@@ -20,28 +21,31 @@ class CellElement:
 
 
 class CognitiveEngine:
-    """
-    Recursive MAI engine built around logical cellophane cells.
+    """Recursive MAI engine built around logical cellophane cells.
 
-    Each source Unit owns a logical cell containing many CellElements.
-    A CellElement stores an address-like next_unit_id together with the
-    sentence/pass/position coordinates of the observation that created it.
+    Persistent observations are never retroactively rewritten.
 
     Top view:
-      follow only the current input's next_unit_id sequence and count how many
-      historical sentence layers survive. pass_id is not required to equal the
-      current processing pass; it is only a coordinate inside the stored layer.
+      each source Unit is a logical cell containing observed next-unit addresses.
+      For the currently active sequence, the number of matching CellElements is
+      the density itself. No separate semantic score is required.
+
+    Lazy projection:
+      higher-depth Units live independently from the observations that first
+      produced their children. When an old sentence becomes active again,
+      existing compositions are overlaid on that active sequence without
+      rewriting the old observation.
 
     Side view:
-      sentence_id + pass_id + position and compositions preserve the vertical
-      derivation history, so the same storage can reconstruct cross sections.
+      sentence_id + pass_id + position preserve observed layers, while
+      compositions preserve vertical parent/child structure.
     """
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self.db = Database(db_path)
         self.conn = self.db.conn
-        # source -> next -> {(sentence_id, stored_pass_id, position): opacity}
         self._cell_cache: dict[str, dict[str, dict[LayerKey, float]]] = {}
+        self._composition_cache: dict[str, list[CompositionCandidate]] = {}
 
     def close(self) -> None:
         self.db.close()
@@ -62,6 +66,29 @@ class CognitiveEngine:
         ).fetchone()
         return str(row["content"]) if row else unit_id
 
+    def _composition_exists(self, parent_id: str, child_ids: list[str]) -> bool:
+        rows = self.conn.execute(
+            """
+            SELECT child_unit_id
+            FROM compositions
+            WHERE parent_unit_id = ?
+            ORDER BY position
+            """,
+            (parent_id,),
+        ).fetchall()
+        existing = [str(row["child_unit_id"]) for row in rows]
+        return existing == child_ids
+
+    def _record_composition(self, parent_id: str, child_ids: list[str]) -> None:
+        self.conn.executemany(
+            """
+            INSERT INTO compositions (parent_unit_id, child_unit_id, position)
+            VALUES (?, ?, ?)
+            """,
+            [(parent_id, child_id, pos) for pos, child_id in enumerate(child_ids)],
+        )
+        self._composition_cache.clear()
+
     def get_or_create_unit(
         self,
         content: str,
@@ -72,33 +99,34 @@ class CognitiveEngine:
         else:
             depth = max(self.get_unit_depth(uid) for uid in child_unit_ids) + 1
 
-        row = self.conn.execute(
+        candidates = self.conn.execute(
             "SELECT unit_id FROM units WHERE depth = ? AND content = ?",
             (depth, content),
-        ).fetchone()
-        if row:
-            return str(row["unit_id"])
+        ).fetchall()
 
+        if not child_unit_ids:
+            if candidates:
+                return str(candidates[0]["unit_id"])
+        else:
+            for row in candidates:
+                unit_id = str(row["unit_id"])
+                if self._composition_exists(unit_id, child_unit_ids):
+                    return unit_id
+
+        # Same surface content at the same depth may still be a different Unit
+        # when its composition lineage is different.
         unit_id = f"unit-d{depth}-{uuid.uuid4().hex[:8]}"
         self.conn.execute(
             "INSERT INTO units (unit_id, depth, content, support_count) VALUES (?, ?, ?, 1)",
             (unit_id, depth, content),
         )
-
         if child_unit_ids:
-            self.conn.executemany(
-                """
-                INSERT INTO compositions (parent_unit_id, child_unit_id, position)
-                VALUES (?, ?, ?)
-                """,
-                [(unit_id, child_id, pos) for pos, child_id in enumerate(child_unit_ids)],
-            )
-
+            self._record_composition(unit_id, child_unit_ids)
         self.conn.commit()
         return unit_id
 
     # ------------------------------------------------------------------ #
-    # Cell cache / top-view storage                                        #
+    # Cell storage / raw top-view density                                  #
     # ------------------------------------------------------------------ #
 
     def _cell_targets(self, source_unit_id: str) -> dict[str, dict[LayerKey, float]]:
@@ -115,7 +143,6 @@ class CognitiveEngine:
             """,
             (source_unit_id,),
         ).fetchall()
-
         for row in rows:
             next_id = str(row["next_unit_id"])
             key: LayerKey = (
@@ -128,39 +155,17 @@ class CognitiveEngine:
         self._cell_cache[source_unit_id] = targets
         return targets
 
-    def _matching_paths(
+    def _edge_density(
         self,
         source_unit_id: str,
         next_unit_id: str,
-        exclude_sentence_id: str,
-    ) -> dict[LayerKey, float]:
+        exclude_sentence_id: str | None = None,
+    ) -> int:
+        """Return the literal number of matching observed CellElements."""
         paths = self._cell_targets(source_unit_id).get(next_unit_id, {})
-        return {
-            key: opacity
-            for key, opacity in paths.items()
-            if key[0] != exclude_sentence_id
-        }
-
-    def _advance_paths(
-        self,
-        survivors: dict[LayerKey, float],
-        source_unit_id: str,
-        next_unit_id: str,
-    ) -> dict[LayerKey, float]:
-        if not survivors:
-            return {}
-
-        next_paths = self._cell_targets(source_unit_id).get(next_unit_id, {})
-        advanced: dict[LayerKey, float] = {}
-
-        for (sentence_id, stored_pass_id, position), opacity in survivors.items():
-            wanted = (sentence_id, stored_pass_id, position + 1)
-            next_opacity = next_paths.get(wanted)
-            if next_opacity is not None:
-                # Keep the weakest visible point of the surviving historical layer.
-                advanced[wanted] = min(opacity, next_opacity)
-
-        return advanced
+        if exclude_sentence_id is None:
+            return len(paths)
+        return sum(1 for key in paths if key[0] != exclude_sentence_id)
 
     def _record_cell_elements(
         self,
@@ -188,85 +193,176 @@ class CognitiveEngine:
         )
         self.conn.commit()
 
-        # Keep already-loaded logical cells coherent without re-querying SQLite.
         for source, next_id, sid, position, stored_pass_id, _ in rows:
             cached = self._cell_cache.get(source)
             if cached is not None:
                 cached.setdefault(next_id, {})[(sid, stored_pass_id, position)] = 1.0
 
     # ------------------------------------------------------------------ #
-    # Top-view segmentation                                                #
+    # Lazy projection from existing composition structure                 #
     # ------------------------------------------------------------------ #
 
-    def _segment_units(
+    def _composition_candidates(self, first_child_id: str) -> list[CompositionCandidate]:
+        cached = self._composition_cache.get(first_child_id)
+        if cached is not None:
+            return cached
+
+        parent_rows = self.conn.execute(
+            """
+            SELECT DISTINCT c.parent_unit_id, u.depth
+            FROM compositions c
+            JOIN units u ON u.unit_id = c.parent_unit_id
+            WHERE c.child_unit_id = ? AND c.position = 0
+            """,
+            (first_child_id,),
+        ).fetchall()
+
+        candidates: list[CompositionCandidate] = []
+        for parent_row in parent_rows:
+            parent_id = str(parent_row["parent_unit_id"])
+            child_rows = self.conn.execute(
+                """
+                SELECT child_unit_id
+                FROM compositions
+                WHERE parent_unit_id = ?
+                ORDER BY position
+                """,
+                (parent_id,),
+            ).fetchall()
+            children = tuple(str(row["child_unit_id"]) for row in child_rows)
+            if children:
+                candidates.append((parent_id, children, int(parent_row["depth"])))
+
+        candidates.sort(key=lambda item: (item[2], len(item[1])), reverse=True)
+        self._composition_cache[first_child_id] = candidates
+        return candidates
+
+    def _project_existing_units(self, unit_ids: list[str]) -> list[str]:
+        """Overlay already-known higher Units on an active sequence.
+
+        This is read-only with respect to observations: old sentence layers are
+        not rewritten. The returned list is only the current active view.
+        """
+        if len(unit_ids) <= 1:
+            return list(unit_ids)
+
+        projected: list[str] = []
+        index = 0
+        while index < len(unit_ids):
+            matched_parent: str | None = None
+            matched_length = 0
+
+            for parent_id, children, _ in self._composition_candidates(unit_ids[index]):
+                end = index + len(children)
+                if end > len(unit_ids):
+                    continue
+                if tuple(unit_ids[index:end]) == children:
+                    matched_parent = parent_id
+                    matched_length = len(children)
+                    break
+
+            if matched_parent is None:
+                projected.append(unit_ids[index])
+                index += 1
+            else:
+                projected.append(matched_parent)
+                index += matched_length
+
+        return projected
+
+    def _project_until_stable(self, unit_ids: list[str]) -> list[list[str]]:
+        layers: list[list[str]] = []
+        current = list(unit_ids)
+        for _ in range(100):
+            projected = self._project_existing_units(current)
+            if projected == current:
+                break
+            layers.append(projected)
+            current = projected
+            if len(current) == 1:
+                break
+        return layers
+
+    def _load_observed_layer(self, sentence_id: str, pass_id: int = 0) -> list[str]:
+        rows = self.conn.execute(
+            """
+            SELECT source_unit_id, next_unit_id, position
+            FROM cell_elements
+            WHERE sentence_id = ? AND pass_id = ?
+            ORDER BY position
+            """,
+            (sentence_id, pass_id),
+        ).fetchall()
+        if not rows:
+            return []
+
+        result = [str(row["source_unit_id"]) for row in rows]
+        result.append(str(rows[-1]["next_unit_id"]))
+        return result
+
+    def activate_sentence(self, sentence_id: str) -> dict[str, Any]:
+        """Read-only lazy side-view projection for a stored sentence."""
+        base_ids = self._load_observed_layer(sentence_id, 0)
+        projection_layers = self._project_until_stable(base_ids)
+
+        layers: list[dict[str, Any]] = []
+        if base_ids:
+            layers.append(
+                {
+                    "level": 0,
+                    "unit_ids": base_ids,
+                    "contents": [self.get_unit_content(uid) for uid in base_ids],
+                    "depths": [self.get_unit_depth(uid) for uid in base_ids],
+                }
+            )
+        for level, projected in enumerate(projection_layers, start=1):
+            layers.append(
+                {
+                    "level": level,
+                    "unit_ids": projected,
+                    "contents": [self.get_unit_content(uid) for uid in projected],
+                    "depths": [self.get_unit_depth(uid) for uid in projected],
+                }
+            )
+
+        return {"sentence_id": sentence_id, "layers": layers}
+
+    # ------------------------------------------------------------------ #
+    # Density-driven discovery                                             #
+    # ------------------------------------------------------------------ #
+
+    def _discover_from_density(
         self,
         unit_ids: list[str],
         current_sentence_id: str,
-    ) -> list[str]:
-        """
-        Overlay the current sequence on the logical cells.
+    ) -> tuple[list[str], list[int]]:
+        """Create new Units directly from visible overlap in the active layer."""
+        if len(unit_ids) <= 1:
+            return list(unit_ids), []
 
-        At each start position, historical layers that point somewhere else are
-        discarded one Unit at a time. The surviving CellElement count is the
-        top-view density for that span. The span with the largest surviving
-        layer count is selected; equal counts prefer the longer span.
-
-        No candidate Unit is written while evaluating spans. Only the finally
-        selected blocks are materialized in the database.
-        """
-        length = len(unit_ids)
-        if length <= 1:
-            return list(unit_ids)
+        densities = [
+            self._edge_density(unit_ids[i], unit_ids[i + 1], current_sentence_id)
+            for i in range(len(unit_ids) - 1)
+        ]
 
         result: list[str] = []
-        start = 0
-
-        while start < length:
-            if start == length - 1:
-                result.append(unit_ids[start])
-                break
-
-            survivors = self._matching_paths(
-                unit_ids[start],
-                unit_ids[start + 1],
-                current_sentence_id,
-            )
-
-            best_end = start + 1
-            best_count = 0
-
-            if survivors:
-                best_end = start + 2
-                best_count = len(survivors)
-
-                cursor = start + 1
-                while cursor < length - 1:
-                    survivors = self._advance_paths(
-                        survivors,
-                        unit_ids[cursor],
-                        unit_ids[cursor + 1],
-                    )
-                    if not survivors:
-                        break
-
-                    end = cursor + 2
-                    count = len(survivors)
-                    if count > best_count or (count == best_count and end > best_end):
-                        best_count = count
-                        best_end = end
-                    cursor += 1
-
-            if best_count == 0:
-                result.append(unit_ids[start])
-                start += 1
+        index = 0
+        while index < len(unit_ids):
+            if index >= len(densities) or densities[index] == 0:
+                result.append(unit_ids[index])
+                index += 1
                 continue
 
-            child_ids = unit_ids[start:best_end]
+            end = index + 1
+            while end < len(densities) and densities[end] > 0:
+                end += 1
+
+            child_ids = unit_ids[index : end + 1]
             content = "".join(self.get_unit_content(uid) for uid in child_ids)
             result.append(self.get_or_create_unit(content, child_ids))
-            start = best_end
+            index = end + 1
 
-        return result
+        return result, densities
 
     # ------------------------------------------------------------------ #
     # Feedback                                                             #
@@ -299,8 +395,6 @@ class CognitiveEngine:
             (multiplier, sentence_id),
         )
         self.conn.commit()
-
-        # Feedback changed persistent visibility; refresh lazily on next access.
         self._cell_cache.clear()
         return new_avg
 
@@ -324,12 +418,13 @@ class CognitiveEngine:
 
         pass_results: list[dict[str, Any]] = []
         pass_id = 0
-        max_pass_limit = 100
 
-        while pass_id < max_pass_limit:
-            segmented_ids = self._segment_units(current_unit_ids, sentence_id)
+        while pass_id < 100:
+            projected_ids = self._project_existing_units(current_unit_ids)
+            segmented_ids, densities = self._discover_from_density(
+                projected_ids, sentence_id
+            )
 
-            # Store the exact layer that was seen before moving upward.
             self._record_cell_elements(current_unit_ids, pass_id, sentence_id)
 
             contents = [self.get_unit_content(uid) for uid in segmented_ids]
@@ -342,6 +437,7 @@ class CognitiveEngine:
                     "unit_ids": segmented_ids,
                     "contents": contents,
                     "depths": depths,
+                    "top_view_densities": densities,
                 }
             )
 
