@@ -1,21 +1,18 @@
 # MAI Core
 
-The `core` directory is reserved for the reusable cognitive engine.
+The `core` directory contains the reusable cognitive engine and graph storage model.
 
-It should own the recursive Unit model, depth/lineage rules, storage abstractions, extraction, activation, thinking, and realization logic.
-
-The core must not depend on a specific UI, web framework, CLI, or product shell.
-
-Planned internal areas may eventually include:
+## Structure
 
 ```text
 core/
-  unit/
-  extraction/
-  memory/
-  think/
-  realization/
-  storage/
+  db.py       : SQLite graph database initialization, schema, and migration
+  engine.py   : CognitiveEngine implementation
+                - _segment_units_at_depth(): Cellophane overlap unit segmentation
+                - process_sentence(): Recursive vertical layering loop
+                - _think_side_view(): Cross-sectional associative thinking (depth >= 2)
+                - apply_feedback(): 0~100 score cellophane opacity adjustment (depth >= 2)
+  __init__.py : Core module interface
 ```
 
-These folders are intentionally not created yet because their boundaries are still under design.
+The core engine operates independently of UI or CLI application layers.

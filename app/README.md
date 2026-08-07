@@ -1,15 +1,17 @@
 # MAI Application Layer
 
-The `app` directory is reserved for interfaces built on top of MAI Core.
+The `app` directory contains interfaces built on top of MAI Core.
 
-Examples include:
+## Structure
 
-- web UI
-- desktop UI
-- CLI
-- API server
-- external adapters
+```text
+app/
+  cli.py   : Interactive command-line interface for sentence processing and feedback
+  main.py  : Entry point executing run_cli()
+```
 
-Applications may depend on `core`, but `core` should not depend on anything inside `app`.
+## Usage
 
-This keeps the cognitive engine reusable while allowing product-facing interfaces to evolve independently.
+```bash
+python -m app.main
+```
