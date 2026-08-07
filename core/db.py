@@ -96,14 +96,14 @@ class Database:
         if not required.issubset(columns):
             return
 
-        pass_expr = "pass_id" if "pass_id" in columns else "0"
+        pass_expr = "ul.pass_id" if "pass_id" in columns else "0"
         if "link_depth" in columns:
-            depth_expr = "link_depth"
+            depth_expr = "ul.link_depth"
         elif "depth" in columns:
-            depth_expr = "depth"
+            depth_expr = "ul.depth"
         else:
             depth_expr = "0"
-        opacity_expr = "opacity" if "opacity" in columns else "1.0"
+        opacity_expr = "ul.opacity" if "opacity" in columns else "1.0"
 
         self.conn.execute(
             f"""
