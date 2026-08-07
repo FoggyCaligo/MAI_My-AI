@@ -1,26 +1,44 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from .db import Database, get_default_db_path
 
-PathState = tuple[str, int, float]  # (sentence_id, position, opacity)
+# PathState: (sentence_id, position, opacity)
+PathState = tuple[str, int, float]
 
 
 @dataclass(slots=True)
 class UnitChoice:
-    segment_units: list[str]  # list of unit_ids
+    segment_units: list[str]          # list of unit_ids (may be mixed depths)
     next_index: int
     support_score: float
     supported_length: int
     piece_count: int
 
 
+def _compute_merged_depth(child_unit_depths: list[int]) -> int:
+    """
+    new_depth = max(child.depth) + 1
+    This is the canonical MAI depth rule.
+    """
+    return max(child_unit_depths) + 1
+
+
 class CognitiveEngine:
-    """Multi-depth cognitive engine using cellophane layering, opacity feedback, and side-view thinking."""
+    """
+    Multi-depth cognitive engine.
+
+    Key separation:
+      pass_id  — which iteration of the recursive loop (0, 1, 2, …)
+      unit.depth — max(child.depth) + 1, independent of pass_id
+
+    Units are never replaced. [눈]d0 and [눈꽃]d1 coexist in the DB.
+    A new composition references its actual child unit_ids to compute its own depth.
+    """
 
     def __init__(self, db_path: str | Path | None = None) -> None:
         self.db = Database(db_path)
@@ -29,8 +47,35 @@ class CognitiveEngine:
     def close(self) -> None:
         self.db.close()
 
-    def get_or_create_unit(self, depth: int, content: str) -> str:
-        """Find existing unit or create a new unit at specified depth."""
+    # ------------------------------------------------------------------ #
+    # Unit helpers                                                         #
+    # ------------------------------------------------------------------ #
+
+    def get_unit_depth(self, unit_id: str) -> int:
+        row = self.conn.execute(
+            "SELECT depth FROM units WHERE unit_id = ?", (unit_id,)
+        ).fetchone()
+        return int(row["depth"]) if row else 0
+
+    def get_unit_content(self, unit_id: str) -> str:
+        row = self.conn.execute(
+            "SELECT content FROM units WHERE unit_id = ?", (unit_id,)
+        ).fetchone()
+        return str(row["content"]) if row else unit_id
+
+    def get_or_create_unit(self, content: str, child_unit_ids: list[str] | None = None) -> str:
+        """
+        Find or create a unit whose depth is computed from its children.
+        - depth 0 units (characters): child_unit_ids = None or []
+        - higher units: depth = max(child.depth) + 1
+        Compositions are recorded for every new higher-level unit.
+        """
+        if not child_unit_ids:
+            depth = 0
+        else:
+            child_depths = [self.get_unit_depth(uid) for uid in child_unit_ids]
+            depth = _compute_merged_depth(child_depths)
+
         row = self.conn.execute(
             "SELECT unit_id FROM units WHERE depth = ? AND content = ?",
             (depth, content),
@@ -41,53 +86,59 @@ class CognitiveEngine:
 
         unit_id = f"unit-d{depth}-{uuid.uuid4().hex[:8]}"
         self.conn.execute(
-            """
-            INSERT INTO units (unit_id, depth, content, support_count)
-            VALUES (?, ?, ?, 1)
-            """,
+            "INSERT INTO units (unit_id, depth, content, support_count) VALUES (?, ?, ?, 1)",
             (unit_id, depth, content),
         )
+
+        if child_unit_ids:
+            self.conn.executemany(
+                "INSERT INTO compositions (parent_unit_id, child_unit_id, position) VALUES (?, ?, ?)",
+                [(unit_id, cid, pos) for pos, cid in enumerate(child_unit_ids)],
+            )
+
         self.conn.commit()
         return unit_id
 
-    def get_unit_content(self, unit_id: str) -> str:
-        row = self.conn.execute(
-            "SELECT content FROM units WHERE unit_id = ?", (unit_id,)
-        ).fetchone()
-        return str(row["content"]) if row else unit_id
+    # ------------------------------------------------------------------ #
+    # Feedback                                                             #
+    # ------------------------------------------------------------------ #
 
     def apply_feedback(self, sentence_id: str, score: float) -> float:
         """
-        Applies user feedback score (0 to 100) subtly to thought/concept layers (Depth >= 2).
-        - 50 points: No change (multiplier = 1.0)
-        - 100 points: Subtle increase (+25%, multiplier = 1.25)
-        - 0 points: Subtle decrease (-25%, multiplier = 0.75)
-        Depth 0 (character) and Depth 1 (word segmentation) layers remain untouched.
+        Applies user feedback score (0–100) subtly to thought layers (link_depth >= 2).
+          50  → multiplier = 1.0  (no change)
+          100 → multiplier = 1.25 (+25 %)
+          0   → multiplier = 0.75 (−25 %)
+        Depth-0 and depth-1 links remain untouched.
         """
-        clamped_score = max(0.0, min(100.0, float(score)))
-        # Subtle multiplier range: 50 -> 1.0, 100 -> 1.25, 0 -> 0.75
-        multiplier = 1.0 + (clamped_score - 50.0) * 0.005
+        clamped = max(0.0, min(100.0, float(score)))
+        multiplier = 1.0 + (clamped - 50.0) * 0.005
 
         rows = self.conn.execute(
-            "SELECT opacity FROM unit_links WHERE sentence_id = ? AND depth >= 2", (sentence_id,)
+            "SELECT opacity FROM unit_links WHERE sentence_id = ? AND link_depth >= 2",
+            (sentence_id,),
         ).fetchall()
 
         if not rows:
             return 1.0
 
-        current_avg_opacity = sum(float(r["opacity"]) for r in rows) / len(rows)
-        new_avg_opacity = max(0.01, min(10.0, current_avg_opacity * multiplier))
+        avg = sum(float(r["opacity"]) for r in rows) / len(rows)
+        new_avg = max(0.01, min(10.0, avg * multiplier))
 
         self.conn.execute(
             """
             UPDATE unit_links
             SET opacity = MAX(0.01, MIN(10.0, opacity * ?))
-            WHERE sentence_id = ? AND depth >= 2
+            WHERE sentence_id = ? AND link_depth >= 2
             """,
             (multiplier, sentence_id),
         )
         self.conn.commit()
-        return new_avg_opacity
+        return new_avg
+
+    # ------------------------------------------------------------------ #
+    # Main entry point                                                     #
+    # ------------------------------------------------------------------ #
 
     def process_sentence(self, raw_text: str) -> dict[str, Any]:
         normalized = str(raw_text).strip()
@@ -95,78 +146,88 @@ class CognitiveEngine:
             return {
                 "sentence_id": "",
                 "raw_text": "",
-                "depth_results": [],
+                "pass_results": [],
                 "word_segments": [],
                 "thought_results": [],
             }
 
         sentence_id = f"sentence-{uuid.uuid4().hex[:8]}"
 
-        depth_results: list[dict[str, Any]] = []
-        
-        # Start at Depth 0: Characters
-        char_units = [self.get_or_create_unit(0, ch) for ch in list(normalized)]
-        current_units = char_units
+        # Pass 0: characters (depth 0 units, mixed-depth allowed from pass 1 onward)
+        current_unit_ids: list[str] = [
+            self.get_or_create_unit(ch, None) for ch in list(normalized)
+        ]
 
-        depth = 0
-        max_depth_limit = 100  # Safety circuit-breaker
+        pass_results: list[dict[str, Any]] = []
+        pass_id = 0
+        max_pass_limit = 100
 
-        while depth < max_depth_limit:
-            # 1. Segment current units using cellophane overlap at this depth
-            segmented_unit_ids = self._segment_units_at_depth(current_units, depth)
+        while pass_id < max_pass_limit:
+            # 1. Segment — may return units of mixed actual depths
+            segmented_ids = self._segment_units(current_unit_ids, pass_id, sentence_id)
 
-            # 2. Ingest transition links for current level
-            self._ingest_unit_links(current_units, depth, sentence_id)
+            # 2. Ingest unit_links for this pass (using actual unit depths for link_depth)
+            self._ingest_unit_links(current_unit_ids, pass_id, sentence_id)
 
-            # Map unit_ids to readable content
-            segmented_contents = [self.get_unit_content(uid) for uid in segmented_unit_ids]
+            contents = [self.get_unit_content(uid) for uid in segmented_ids]
+            depths   = [self.get_unit_depth(uid)   for uid in segmented_ids]
 
-            depth_results.append({
-                "depth": depth,
-                "input_count": len(current_units),
-                "output_count": len(segmented_unit_ids),
-                "unit_ids": segmented_unit_ids,
-                "contents": segmented_contents,
+            pass_results.append({
+                "pass_id":      pass_id,
+                "input_count":  len(current_unit_ids),
+                "output_count": len(segmented_ids),
+                "unit_ids":     segmented_ids,
+                "contents":     contents,
+                "depths":       depths,
             })
 
-            # Check Termination Condition:
-            # 1. "입력 문장 전체가 하나의 덩어리로 잡힐 때까지"
-            if len(segmented_unit_ids) == 1:
+            # Termination: whole sentence is one unit
+            if len(segmented_ids) == 1:
                 break
 
-            # 2. 더 이상 덩어리로 줄어들지 않고 동일할 경우 termination
-            if segmented_unit_ids == current_units:
+            # Termination: no further reduction
+            if segmented_ids == current_unit_ids:
                 break
 
-            # Prepare higher depth units for next pass
-            next_units = []
-            for content in segmented_contents:
-                next_uid = self.get_or_create_unit(depth + 1, content)
-                next_units.append(next_uid)
-            current_units = next_units
+            current_unit_ids = segmented_ids
+            pass_id += 1
 
-            depth += 1
+        # Word segments come from pass 0 output
+        word_segments = pass_results[0]["contents"] if pass_results else []
 
-        # Word segmentation result is from Depth 0 -> Depth 1
-        word_segments = depth_results[0]["contents"] if depth_results else []
-
-        # Side-View Thinking: Executed ONLY AFTER vertical layering terminates!
-        thought_results = self._think_side_view(sentence_id, depth_results)
+        # Side-View Thinking (after vertical layering is done)
+        thought_results = self._think_side_view(sentence_id, pass_results)
 
         return {
-            "sentence_id": sentence_id,
-            "raw_text": normalized,
+            "sentence_id":   sentence_id,
+            "raw_text":      normalized,
             "word_segments": word_segments,
-            "depth_results": depth_results,
+            "pass_results":  pass_results,
             "thought_results": thought_results,
         }
 
-    def _segment_units_at_depth(self, unit_ids: list[str], depth: int) -> list[str]:
+    # ------------------------------------------------------------------ #
+    # Segmentation                                                         #
+    # ------------------------------------------------------------------ #
+
+    def _segment_units(
+        self,
+        unit_ids: list[str],
+        pass_id: int,
+        sentence_id: str,
+    ) -> list[str]:
+        """
+        Cellophane overlap segmentation over a list of unit_ids (mixed depths OK).
+        Returns unit_ids that may include:
+          - original unit_ids that were not merged (any depth)
+          - newly created merged units whose depth = max(child.depth) + 1
+        """
         length = len(unit_ids)
         if length <= 1:
             return list(unit_ids)
 
-        step_matches = self._build_step_matches(unit_ids, depth)
+        step_matches = self._build_step_matches(unit_ids, pass_id)
+
         best: list[UnitChoice | None] = [None] * (length + 1)
         best[length] = UnitChoice([], length, 0.0, 0, 0)
 
@@ -174,7 +235,6 @@ class CognitiveEngine:
             fallback = best[start + 1]
             assert fallback is not None
 
-            # Single unit fallback
             best_choice = UnitChoice(
                 segment_units=[unit_ids[start]],
                 next_index=start + 1,
@@ -184,23 +244,24 @@ class CognitiveEngine:
             )
 
             for end in range(start + 2, length + 1):
-                support_score = self._support_score(step_matches, start, end)
-                if support_score == 0.0:
+                score = self._support_score(step_matches, start, end)
+                if score == 0.0:
                     continue
 
                 remainder = best[end]
                 assert remainder is not None
-                span_length = end - start
+                span = end - start
 
-                # Create merged content for span
-                merged_content = "".join(self.get_unit_content(uid) for uid in unit_ids[start:end])
-                merged_unit_id = self.get_or_create_unit(depth + 1, merged_content)
+                # Merge: depth is computed from actual child depths
+                child_ids = unit_ids[start:end]
+                merged_content = "".join(self.get_unit_content(uid) for uid in child_ids)
+                merged_id = self.get_or_create_unit(merged_content, child_ids)
 
                 candidate = UnitChoice(
-                    segment_units=[merged_unit_id],
+                    segment_units=[merged_id],
                     next_index=end,
-                    support_score=remainder.support_score + (support_score * span_length),
-                    supported_length=remainder.supported_length + span_length,
+                    support_score=remainder.support_score + score * span,
+                    supported_length=remainder.supported_length + span,
                     piece_count=remainder.piece_count + 1,
                 )
 
@@ -209,33 +270,41 @@ class CognitiveEngine:
 
             best[start] = best_choice
 
-        result_units: list[str] = []
-        index = 0
-        while index < length:
-            choice = best[index]
+        result: list[str] = []
+        idx = 0
+        while idx < length:
+            choice = best[idx]
             assert choice is not None
-            result_units.extend(choice.segment_units)
-            index = choice.next_index
-        return result_units
+            result.extend(choice.segment_units)
+            idx = choice.next_index
+        return result
 
-    def _build_step_matches(self, unit_ids: list[str], depth: int) -> list[set[PathState]]:
+    # ------------------------------------------------------------------ #
+    # Cellophane overlap helpers                                           #
+    # ------------------------------------------------------------------ #
+
+    def _build_step_matches(
+        self, unit_ids: list[str], pass_id: int
+    ) -> list[set[PathState]]:
         step_matches: list[set[PathState]] = []
         for i in range(len(unit_ids) - 1):
             rows = self.conn.execute(
                 """
                 SELECT sentence_id, position, opacity
                 FROM unit_links
-                WHERE source_unit_id = ? AND target_unit_id = ? AND depth = ?
+                WHERE source_unit_id = ? AND target_unit_id = ? AND pass_id = ?
                 """,
-                (unit_ids[i], unit_ids[i + 1], depth),
+                (unit_ids[i], unit_ids[i + 1], pass_id),
             ).fetchall()
             step_matches.append({
-                (str(row["sentence_id"]), int(row["position"]), float(row["opacity"]))
-                for row in rows
+                (str(r["sentence_id"]), int(r["position"]), float(r["opacity"]))
+                for r in rows
             })
         return step_matches
 
-    def _support_score(self, step_matches: list[set[PathState]], start: int, end: int) -> float:
+    def _support_score(
+        self, step_matches: list[set[PathState]], start: int, end: int
+    ) -> float:
         if end - start < 2:
             return 0.0
 
@@ -249,134 +318,141 @@ class CognitiveEngine:
                 return 0.0
 
             advanced: set[PathState] = set()
-            for sentence_id, position, opacity in survivors:
-                # Find matching target state in next step
-                matching_next = [
-                    (s_id, pos, op)
-                    for s_id, pos, op in next_matches
-                    if s_id == sentence_id and pos == position + 1
-                ]
-                for next_state in matching_next:
-                    advanced.add(next_state)
+            for s_id, pos, op in survivors:
+                for ns_id, npos, nop in next_matches:
+                    if ns_id == s_id and npos == pos + 1:
+                        advanced.add((ns_id, npos, nop))
 
             survivors = advanced
             if not survivors:
                 return 0.0
 
-        # Sum opacity across all surviving path layers
-        return sum(opacity for _, _, opacity in survivors)
+        return sum(op for _, _, op in survivors)
 
     def _is_better(self, candidate: UnitChoice, current: UnitChoice) -> bool:
-        candidate_key = (
+        return (
             candidate.support_score,
             candidate.supported_length,
             -candidate.piece_count,
-        )
-        current_key = (
+        ) > (
             current.support_score,
             current.supported_length,
             -current.piece_count,
         )
-        return candidate_key > current_key
 
-    def _ingest_unit_links(self, unit_ids: list[str], depth: int, sentence_id: str) -> None:
+    def _ingest_unit_links(
+        self, unit_ids: list[str], pass_id: int, sentence_id: str
+    ) -> None:
+        """
+        Record transition links for this pass.
+        link_depth = max(source.depth, target.depth)  — reflects actual unit depth.
+        """
         if len(unit_ids) < 2:
             return
 
+        rows = []
+        for i in range(len(unit_ids) - 1):
+            src, tgt = unit_ids[i], unit_ids[i + 1]
+            link_depth = max(self.get_unit_depth(src), self.get_unit_depth(tgt))
+            rows.append((src, tgt, sentence_id, i, pass_id, link_depth))
+
         self.conn.executemany(
             """
-            INSERT INTO unit_links (source_unit_id, target_unit_id, sentence_id, position, depth)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO unit_links
+              (source_unit_id, target_unit_id, sentence_id, position, pass_id, link_depth)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (
-                (unit_ids[i], unit_ids[i + 1], sentence_id, i, depth)
-                for i in range(len(unit_ids) - 1)
-            ),
+            rows,
         )
         self.conn.commit()
 
-    def _think_side_view(self, current_sentence_id: str, depth_results: list[dict[str, Any]]) -> list[str]:
-        """
-        Side-View Cross-Section Thinking:
-        Collects unit_ids active in the current sentence from Depth 2 and above,
-        finds intersecting sentence_ids, and extracts associative units.
-        Filters out particle plateau groups (과도하게 튀면서 엇비슷한 고빈도 조사 그룹)
-        and returns the Top 20 most prominent conceptual units.
-        """
-        active_unit_ids = set()
-        for dr in depth_results:
-            if dr["depth"] >= 2:
-                active_unit_ids.update(dr["unit_ids"])
+    # ------------------------------------------------------------------ #
+    # Side-View Thinking                                                   #
+    # ------------------------------------------------------------------ #
 
-        if not active_unit_ids:
+    def _think_side_view(
+        self,
+        current_sentence_id: str,
+        pass_results: list[dict[str, Any]],
+    ) -> list[str]:
+        """
+        Cross-sectional association.
+        Uses unit_ids whose actual depth >= 2 (thought/concept layer).
+        Filters particle plateaus and returns Top-20 by opacity weight.
+        """
+        active_ids: set[str] = set()
+        for pr in pass_results:
+            for uid, d in zip(pr["unit_ids"], pr["depths"]):
+                if d >= 2:
+                    active_ids.add(uid)
+
+        if not active_ids:
             return []
 
-        placeholders = ",".join("?" for _ in active_unit_ids)
-        query = f"""
-            SELECT DISTINCT sentence_id
-            FROM unit_links
-            WHERE (source_unit_id IN ({placeholders}) OR target_unit_id IN ({placeholders}))
-              AND depth >= 2
+        ph = ",".join("?" * len(active_ids))
+        id_list = list(active_ids)
+
+        rows = self.conn.execute(
+            f"""
+            SELECT DISTINCT sentence_id FROM unit_links
+            WHERE (source_unit_id IN ({ph}) OR target_unit_id IN ({ph}))
+              AND link_depth >= 2
               AND sentence_id != ?
-        """
-        params = list(active_unit_ids) + list(active_unit_ids) + [current_sentence_id]
-        rows = self.conn.execute(query, params).fetchall()
+            """,
+            id_list + id_list + [current_sentence_id],
+        ).fetchall()
 
-        intersecting_sentence_ids = [str(r["sentence_id"]) for r in rows]
-        if not intersecting_sentence_ids:
+        intersecting = [str(r["sentence_id"]) for r in rows]
+        if not intersecting:
             return []
 
-        # Fetch candidate units ordered by total opacity weight
-        sent_placeholders = ",".join("?" for _ in intersecting_sentence_ids)
-        unit_query = f"""
-            SELECT u.content, SUM(ul.opacity) as total_weight, COUNT(ul.id) as freq
+        sph = ",".join("?" * len(intersecting))
+        assoc_rows = self.conn.execute(
+            f"""
+            SELECT u.content, SUM(ul.opacity) as total_weight
             FROM unit_links ul
             JOIN units u ON ul.target_unit_id = u.unit_id
-            WHERE ul.sentence_id IN ({sent_placeholders})
-              AND ul.depth >= 2
+            WHERE ul.sentence_id IN ({sph})
+              AND ul.link_depth >= 2
               AND u.depth >= 2
             GROUP BY u.content
             ORDER BY total_weight DESC
-        """
-        assoc_rows = self.conn.execute(unit_query, intersecting_sentence_ids).fetchall()
+            """,
+            intersecting,
+        ).fetchall()
 
-        current_contents = set()
-        for dr in depth_results:
-            current_contents.update(dr["contents"])
+        current_contents: set[str] = set()
+        for pr in pass_results:
+            current_contents.update(pr["contents"])
 
-        raw_candidates: list[tuple[str, float]] = []
+        raw: list[tuple[str, float]] = []
         for r in assoc_rows:
-            word = str(r["content"]).strip()
-            weight = float(r["total_weight"])
-            if word and word not in current_contents and word not in [w for w, _ in raw_candidates]:
-                raw_candidates.append((word, weight))
+            w = str(r["content"]).strip()
+            wt = float(r["total_weight"])
+            if w and w not in current_contents and w not in [x for x, _ in raw]:
+                raw.append((w, wt))
 
-        if not raw_candidates:
+        if not raw:
             return []
 
-        # Korean particles / functional suffixes that form high-frequency plateau groups
         PARTICLE_SET = {
             "은", "는", "이", "가", "을", "를", "의", "에", "로", "으로",
             "도", "과", "와", "에서", "에게", "하며", "하고", "이며", "이다",
-            "있다", "없다", "다.", "다", "한", "인", "은,"
+            "있다", "없다", "다.", "다", "한", "인", "은,",
         }
 
-        weights = [w for _, w in raw_candidates]
-        max_w = weights[0] if weights else 1.0
+        max_w = raw[0][1] if raw else 1.0
 
-        filtered_candidates: list[str] = []
-        for word, weight in raw_candidates:
-            # 1. Direct match with particle set
+        filtered: list[str] = []
+        for word, wt in raw:
             if word in PARTICLE_SET:
                 continue
-            # 2. Single-character functional particles
             if len(word) == 1 and word in "은는이가을를의에도과와로한인":
                 continue
-            # 3. High-frequency plateau check: if item is in top 90% weight plateau and particle-heavy
-            if weight >= max_w * 0.85 and any(word.endswith(p) for p in PARTICLE_SET if len(word) <= len(p) + 1):
+            if wt >= max_w * 0.85 and any(
+                word.endswith(p) for p in PARTICLE_SET if len(word) <= len(p) + 1
+            ):
                 continue
+            filtered.append(word)
 
-            filtered_candidates.append(word)
-
-        # Return Top 20 prominent concept units
-        return filtered_candidates[:20]
+        return filtered[:20]
