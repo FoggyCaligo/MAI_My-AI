@@ -37,13 +37,13 @@ SQLite is the persistent store. During segmentation, the engine loads the releva
 ```text
 source Unit
   -> next Unit
-      -> (sentence_id, position)
+      -> (sentence_id, historical_pass_id, position)
           -> opacity
 ```
 
-The current input is overlaid on this index. A historical path survives only while the next address matches and the same `sentence_id` continues at `position + 1`. This means unrelated sentences cannot be stitched together just because their individual edges exist.
+The current input is overlaid on this index. A historical path survives only while the next address matches and the same historical `(sentence_id, pass_id)` continues at `position + 1`. This prevents unrelated sentences or different passes of the same sentence from being stitched into a fake path.
 
-`pass_id` is stored for lineage/debugging but is not required to match for cellophane overlap. Unit depth remains independent and follows:
+The current processing pass does not have to equal the historical pass where a structure was observed. Unit depth remains independent and follows:
 
 ```text
 new_depth = max(child.depth) + 1
