@@ -56,7 +56,7 @@ class CellophaneIndexTests(unittest.TestCase):
 
         self.assertNotIn((0, 3), overlaps)
 
-    def test_pass_id_does_not_block_same_path(self) -> None:
+    def test_different_historical_passes_are_not_stitched(self) -> None:
         a, b, c = self._chars("ABC")
         self.engine.conn.execute(
             """
@@ -80,7 +80,7 @@ class CellophaneIndexTests(unittest.TestCase):
         index = self.engine._load_cell_index(set(units))
         overlaps = self.engine._collect_span_overlaps(units, index)
 
-        self.assertIn((0, 3), overlaps)
+        self.assertNotIn((0, 3), overlaps)
 
     def test_merged_depth_uses_actual_child_depths(self) -> None:
         a, b, c = self._chars("ABC")
