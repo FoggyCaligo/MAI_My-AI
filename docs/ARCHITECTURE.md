@@ -281,7 +281,7 @@ Z Thought Stack
 
 Thought는 X Memory Cube의 관찰 기억이나 Unit 구조를 수정하지 않는다. Y 연상 평면에서 선택한 Unit을 Z축에 놓고 연결·분기하며, 완성된 원본 Thought 셀로판을 append-only로 영속 저장한다. 외부 관찰 기억과 자체 사고 기억은 출처를 구분한다.
 
-현재 Z View는 저장된 Thought를 그대로 시간 간격으로 세지 않는다. 각 Thought Unit이 Y 연상 평면에 남긴 footprint를 복원하고, 같은 Y 좌표를 실제로 차지한 occurrence만 최신순으로 빈칸 없이 압축한다. 서로 겹치지 않는 Thought는 과거 자국의 투명도를 낮추지 않으며, 부분적으로 겹치는 Unit은 교집합 좌표에서만 Z층을 만든다.
+현재 Z View는 저장된 Thought를 그대로 시간 간격으로 세지 않는다. 문장 셀로판은 Unit을 새 좌표에 복제하지 않고 기존 Unit 셀을 참조하며, 순서는 `sentenceId + passId + position`으로 별도 저장한다. 따라서 같은 `unitId`의 Thought occurrence는 항상 같은 Unit 셀에서 겹친다. 서로 다른 depth의 Unit은 `compositions`를 아래로 펼쳤을 때 공유하는 실제 하위 Unit 셀 영역에서만 부분적으로 겹친다. 같은 Unit 셀 영역을 차지한 occurrence만 최신순으로 빈칸 없이 압축하며, 서로 겹치지 않는 Thought는 과거 자국의 투명도를 낮추지 않는다.
 
 ```text
 저장:
@@ -295,7 +295,9 @@ T4: [ ] [ ] [C]
 [A]
 ```
 
-가장 최근 A는 표면의 현재 활성 판단으로 보이고, 아래의 과거 A는 흐려져도 총 가시성에 계속 기여한다. DB에는 원본 사고 순서와 footprint를 보존하고, localZDepth와 visibleOpacity는 조회 시 계산한다.
+가장 최근 A는 표면의 현재 활성 판단으로 보이고, 아래의 과거 A는 흐려져도 총 가시성에 계속 기여한다. DB에는 원본 사고 순서와 직접 참조한 Unit 셀 및 당시 composition footprint를 보존하고, 셀별 localZDepth와 visibleOpacity는 조회 시 계산한다. 동일 Thought 안의 중복 셀은 같은 깊이를 공유하고, 현재 영향력 View에서는 `conclusion`과 `alternative`만 깊이를 만든다. 첫 구현의 감쇠 기본값은 `0.8 ** localZDepth`다.
+
+같은 출발 Unit 셀에서 갈라진 Thought 연결은 출발 셀의 localZDepth를 공유한다. `A -> B` 이후 `A -> C`가 생기면 최근 연결은 depth 0, 과거 연결은 depth 1의 감쇠를 받는다. 원시 반복 횟수인 `thoughtDensity`는 보존하고, Recall 후보와 결론 경로의 현재 영향력 비교에는 감쇠된 `thoughtVisibility`를 사용한다.
 
 완성된 Thought를 자연어로 표현할 때는 특정 depth의 Unit을 단순 연결하지 않는다. 결론 Unit에서 더 깊고 뭉뚱그려진 Unit을 거쳐 같은 depth의 관련 Unit을 찾고, 그 Unit들이 실제로 나타난 `sentenceId + passId` 층을 수집한다. 문장은 문자 길이가 아닌 Unit position별로 겹치며, 가장 진한 골격의 대응 칸들을 현재 결론 Unit으로 교체해 문자열을 만든다.
 

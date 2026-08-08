@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
 from pathlib import Path
 
-from core.engine import CognitiveEngine, ThoughtConfig
+from core.engine import CognitiveEngine, ThoughtConfig, ThoughtNode
 
 
 class ThoughtSpaceTests(unittest.TestCase):
@@ -206,6 +207,244 @@ class ThoughtSpaceTests(unittest.TestCase):
         self.assertEqual(result["unit_ids"][0], motherId)
         self.assertEqual(result["unit_ids"][2], homeId)
         self.assertEqual(len(result["unit_ids"]), 5)
+
+    def test_footprint_includes_identity_and_every_composition_depth(self) -> None:
+        ironId = self._unit("철")
+        waterId = self._unit("수")
+        topicId = self._unit("는")
+        nameId = self.engine.get_or_create_unit("철수", [ironId, waterId])
+        phraseId = self.engine.get_or_create_unit("철수는", [nameId, topicId])
+
+        footprint = self.engine._unitFootprint(phraseId)
+
+        self.assertEqual(footprint[phraseId], ("identity", 0))
+        self.assertEqual(footprint[nameId], ("composition", 1))
+        self.assertEqual(footprint[topicId], ("composition", 1))
+        self.assertEqual(footprint[ironId], ("composition", 2))
+        self.assertEqual(footprint[waterId], ("composition", 2))
+
+    def test_thought_view_uses_sheet_local_depth_and_keeps_rejected_history(self) -> None:
+        aId = self._unit("A")
+        firstRoot = ThoughtNode(
+            elementId="element-first-root",
+            unitId=aId,
+            parentElementId=None,
+            branchId="branch-first",
+            position=0,
+            observedDensity=1,
+            thoughtDensity=0,
+            thoughtVisibility=0.0,
+            opacity=1.0,
+            status="conclusion",
+        )
+        firstRepeat = ThoughtNode(
+            elementId="element-first-repeat",
+            unitId=aId,
+            parentElementId="element-first-root",
+            branchId="branch-first",
+            position=1,
+            observedDensity=1,
+            thoughtDensity=0,
+            thoughtVisibility=0.0,
+            opacity=1.0,
+            status="conclusion",
+        )
+        second = ThoughtNode(
+            elementId="element-second",
+            unitId=aId,
+            parentElementId=None,
+            branchId="branch-second",
+            position=0,
+            observedDensity=1,
+            thoughtDensity=0,
+            thoughtVisibility=0.0,
+            opacity=1.0,
+            status="conclusion",
+        )
+        rejected = ThoughtNode(
+            elementId="element-rejected",
+            unitId=aId,
+            parentElementId=None,
+            branchId="branch-rejected",
+            position=0,
+            observedDensity=1,
+            thoughtDensity=0,
+            thoughtVisibility=0.0,
+            opacity=1.0,
+            status="rejected",
+        )
+
+        self.engine._persistThought(
+            "thought-first",
+            None,
+            {firstRoot.elementId: firstRoot, firstRepeat.elementId: firstRepeat},
+        )
+        self.engine._persistThought(
+            "thought-second",
+            None,
+            {second.elementId: second},
+        )
+        self.engine._persistThought(
+            "thought-rejected",
+            None,
+            {rejected.elementId: rejected},
+        )
+
+        view = self.engine.getThoughtView()
+        cell = next(item for item in view["cells"] if item["unit_id"] == aId)
+        byElement = {
+            item["element_id"]: item for item in cell["occurrences"]
+        }
+
+        self.assertEqual(byElement[second.elementId]["local_z_depth"], 0)
+        self.assertEqual(byElement[firstRoot.elementId]["local_z_depth"], 1)
+        self.assertEqual(byElement[firstRepeat.elementId]["local_z_depth"], 1)
+        self.assertAlmostEqual(
+            byElement[firstRoot.elementId]["visible_opacity"],
+            0.8,
+        )
+        self.assertIsNone(byElement[rejected.elementId]["local_z_depth"])
+        self.assertEqual(byElement[rejected.elementId]["visible_opacity"], 0.0)
+        self.assertFalse(
+            byElement[rejected.elementId]["participates_in_current_view"]
+        )
+
+    def test_recall_applies_source_cell_depth_to_outgoing_thought_edges(self) -> None:
+        aId, bId, cId = [self._unit(content) for content in "ABC"]
+
+        def persistPath(
+            thoughtId: str,
+            rootElementId: str,
+            targetElementId: str,
+            targetUnitId: str,
+        ) -> None:
+            root = ThoughtNode(
+                elementId=rootElementId,
+                unitId=aId,
+                parentElementId=None,
+                branchId=thoughtId,
+                position=0,
+                observedDensity=0,
+                thoughtDensity=0,
+                thoughtVisibility=0.0,
+                opacity=1.0,
+                status="conclusion",
+            )
+            target = ThoughtNode(
+                elementId=targetElementId,
+                unitId=targetUnitId,
+                parentElementId=rootElementId,
+                branchId=thoughtId,
+                position=1,
+                observedDensity=0,
+                thoughtDensity=0,
+                thoughtVisibility=0.0,
+                opacity=1.0,
+                status="conclusion",
+            )
+            self.engine._persistThought(
+                thoughtId,
+                None,
+                {root.elementId: root, target.elementId: target},
+            )
+
+        persistPath("thought-ab", "element-a-old", "element-b", bId)
+        persistPath("thought-ac", "element-a-new", "element-c", cId)
+
+        result = self.engine.recall([aId])
+        candidates = {item["unit_id"]: item for item in result["candidates"]}
+        rankedIds = [item["unit_id"] for item in result["candidates"]]
+
+        self.assertAlmostEqual(candidates[cId]["thought_visibility"], 1.0)
+        self.assertAlmostEqual(candidates[bId]["thought_visibility"], 0.8)
+        self.assertLess(rankedIds.index(cId), rankedIds.index(bId))
+
+
+class ThoughtProjectionMigrationTests(unittest.TestCase):
+    def test_existing_thoughts_receive_sequence_visibility_and_footprint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            dbPath = Path(tmp) / "legacy-thought.db"
+            conn = sqlite3.connect(dbPath)
+            conn.executescript(
+                """
+                CREATE TABLE units (
+                    unit_id TEXT PRIMARY KEY,
+                    depth INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    support_count INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE compositions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    parent_unit_id TEXT NOT NULL,
+                    child_unit_id TEXT NOT NULL,
+                    position INTEGER NOT NULL
+                );
+                CREATE TABLE thoughts (
+                    thought_id TEXT PRIMARY KEY,
+                    source_sentence_id TEXT,
+                    status TEXT NOT NULL DEFAULT 'complete',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE thought_elements (
+                    element_id TEXT PRIMARY KEY,
+                    thought_id TEXT NOT NULL,
+                    unit_id TEXT NOT NULL,
+                    thought_position INTEGER NOT NULL,
+                    branch_id TEXT NOT NULL,
+                    parent_element_id TEXT,
+                    status TEXT NOT NULL,
+                    observed_density INTEGER NOT NULL DEFAULT 0,
+                    thought_density INTEGER NOT NULL DEFAULT 0,
+                    opacity REAL NOT NULL DEFAULT 1.0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE TABLE thought_edges (
+                    edge_id TEXT PRIMARY KEY,
+                    thought_id TEXT NOT NULL,
+                    source_element_id TEXT NOT NULL,
+                    target_element_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    observed_density INTEGER NOT NULL DEFAULT 0,
+                    thought_density INTEGER NOT NULL DEFAULT 0,
+                    opacity REAL NOT NULL DEFAULT 1.0
+                );
+                INSERT INTO units (unit_id, depth, content) VALUES ('unit-a', 0, 'A');
+                INSERT INTO thoughts (thought_id) VALUES ('thought-old');
+                INSERT INTO thought_elements
+                  (element_id, thought_id, unit_id, thought_position, branch_id, status)
+                VALUES ('element-old', 'thought-old', 'unit-a', 0, 'branch-old', 'conclusion');
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            engine = CognitiveEngine(dbPath)
+            try:
+                thought = engine.conn.execute(
+                    "SELECT thought_sequence FROM thoughts WHERE thought_id = 'thought-old'"
+                ).fetchone()
+                elementColumns = {
+                    str(row["name"])
+                    for row in engine.conn.execute(
+                        "PRAGMA table_info(thought_elements)"
+                    ).fetchall()
+                }
+                footprint = engine.conn.execute(
+                    """
+                    SELECT footprint_unit_id, footprint_kind, composition_distance
+                    FROM thought_footprints
+                    WHERE element_id = 'element-old'
+                    """
+                ).fetchone()
+
+                self.assertEqual(int(thought["thought_sequence"]), 1)
+                self.assertIn("thought_visibility", elementColumns)
+                self.assertEqual(str(footprint["footprint_unit_id"]), "unit-a")
+                self.assertEqual(str(footprint["footprint_kind"]), "identity")
+                self.assertEqual(int(footprint["composition_distance"]), 0)
+            finally:
+                engine.close()
 
 
 if __name__ == "__main__":

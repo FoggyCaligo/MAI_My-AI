@@ -71,6 +71,7 @@ ON observed_layer_units (unit_id, sentence_id, pass_id);
 
 CREATE TABLE IF NOT EXISTS thoughts (
     thought_id TEXT PRIMARY KEY,
+    thought_sequence INTEGER,
     source_sentence_id TEXT,
     status TEXT NOT NULL DEFAULT 'complete',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -89,6 +90,7 @@ CREATE TABLE IF NOT EXISTS thought_elements (
     status TEXT NOT NULL,
     observed_density INTEGER NOT NULL DEFAULT 0,
     thought_density INTEGER NOT NULL DEFAULT 0,
+    thought_visibility REAL NOT NULL DEFAULT 0.0,
     opacity REAL NOT NULL DEFAULT 1.0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (thought_id) REFERENCES thoughts(thought_id),
@@ -102,6 +104,21 @@ ON thought_elements (thought_id, thought_position);
 CREATE INDEX IF NOT EXISTS idx_thought_elements_unit_status
 ON thought_elements (unit_id, status);
 
+-- A ThoughtElement occupies its own Unit cell and every real Unit cell reached
+-- while recursively expanding its immutable composition.
+CREATE TABLE IF NOT EXISTS thought_footprints (
+    element_id TEXT NOT NULL,
+    footprint_unit_id TEXT NOT NULL,
+    footprint_kind TEXT NOT NULL,
+    composition_distance INTEGER NOT NULL,
+    PRIMARY KEY (element_id, footprint_unit_id),
+    FOREIGN KEY (element_id) REFERENCES thought_elements(element_id),
+    FOREIGN KEY (footprint_unit_id) REFERENCES units(unit_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_thought_footprints_unit
+ON thought_footprints (footprint_unit_id, element_id);
+
 CREATE TABLE IF NOT EXISTS thought_edges (
     edge_id TEXT PRIMARY KEY,
     thought_id TEXT NOT NULL,
@@ -110,6 +127,7 @@ CREATE TABLE IF NOT EXISTS thought_edges (
     status TEXT NOT NULL,
     observed_density INTEGER NOT NULL DEFAULT 0,
     thought_density INTEGER NOT NULL DEFAULT 0,
+    thought_visibility REAL NOT NULL DEFAULT 0.0,
     opacity REAL NOT NULL DEFAULT 1.0,
     FOREIGN KEY (thought_id) REFERENCES thoughts(thought_id),
     FOREIGN KEY (source_element_id) REFERENCES thought_elements(element_id),
@@ -135,6 +153,8 @@ class Database:
         self.conn.executescript(SCHEMA)
         self._migrate_legacy_unit_links()
         self._migrate_observed_layer_units()
+        self._migrate_thought_projection()
+        self._migrate_thought_visibility()
         self.conn.commit()
 
     def _table_exists(self, table_name: str) -> bool:
@@ -220,6 +240,44 @@ class Database:
             )
             """
         )
+
+    def _migrate_thought_projection(self) -> None:
+        """Add stable append order required by the computed Thought view."""
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(thoughts)").fetchall()
+        }
+        if "thought_sequence" not in columns:
+            self.conn.execute("ALTER TABLE thoughts ADD COLUMN thought_sequence INTEGER")
+
+        self.conn.execute(
+            """
+            UPDATE thoughts
+            SET thought_sequence = rowid
+            WHERE thought_sequence IS NULL
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_thoughts_sequence
+            ON thoughts (thought_sequence)
+            """
+        )
+
+    def _migrate_thought_visibility(self) -> None:
+        """Add computed Thought-view evidence columns to older databases."""
+        for tableName in ("thought_elements", "thought_edges"):
+            columns = {
+                str(row["name"])
+                for row in self.conn.execute(
+                    f"PRAGMA table_info({tableName})"
+                ).fetchall()
+            }
+            if "thought_visibility" not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE {tableName} "
+                    "ADD COLUMN thought_visibility REAL NOT NULL DEFAULT 0.0"
+                )
 
     def close(self) -> None:
         self.conn.close()

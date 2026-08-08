@@ -220,17 +220,30 @@ ThoughtElement
 
 `ThoughtElement`는 새로운 의미 Unit이 아니다. 한 사고 과정에서 기존 Unit이 활성화된 위치를 나타내는 Z축 요소다. Thought가 끝난 뒤에도 사고 흔적으로 남을 수 있지만, 참조하는 X Memory Cube의 Unit 구조를 변경하지 않는다.
 
-각 ThoughtElement는 참조하는 Unit을 통해 Y 연상 평면에 구조적 자국을 가진다.
+각 ThoughtElement는 참조하는 Unit 셀을 통해 연상 평면에 구조적 자국을 가진다. 문장 셀로판은 Unit을 문장마다 새 좌표에 복제하지 않는다. 이미 존재하는 Unit 셀을 참조하고, 당시의 순서만 `sentenceId + passId + position`으로 별도 보존한다.
 
 ```text
-compositionFootprint
-  Unit 자체가 어떤 하위 Unit과 위치로 구성됐는가
+identityFootprint
+  ThoughtElement가 직접 참조한 Unit 셀의 unitId
 
-contextFootprint
-  과거 sentenceId + passId 층에서 어떤 주변 Unit과 함께 있었는가
+compositionFootprint
+  해당 Unit 셀을 compositions 방향으로 펼쳤을 때 만나는 하위 Unit 셀과 구성 위치
+
+historicalContext
+  해당 Unit이 어떤 sentenceId + passId + position 순서에서 관찰됐는가
 ```
 
-Z View는 Unit을 점 하나로만 보지 않는다. 두 Unit의 Y-plane footprint가 일부만 겹치면 겹친 부분에서만 Z층이 형성되고, 나머지 부분은 서로를 가리지 않는다. composition과 context의 겹침은 출처를 구분하여 보존한다.
+같은 `unitId`를 참조하는 Thought occurrence는 문장 안의 position이 달라도 항상 같은 Unit 셀에서 겹친다. 새로운 상위 Unit이 발견되면 다음 구조 depth에 새 Unit 셀이 생기고, `compositions`가 그 셀과 기존 하위 Unit 셀의 연결 및 구성 순서를 보존한다.
+
+```text
+depth 0  [철] [수] [는]
+              ↓ composition
+depth 1  [철수] [는]
+              ↓ composition
+depth 2  [철수는]
+```
+
+`[철수]`와 `[철수는]`는 서로 다른 Unit 셀이지만, composition을 아래로 펼치면 `[철]`, `[수]` 영역을 공유한다. 현재 Thought View는 동일 Unit 셀의 겹침과 서로 다른 depth Unit의 composition 교집합을 구분한다. 부분적으로 겹치는 Unit은 공유하는 하위 Unit 셀 영역에서만 층을 만들고, 나머지 영역에서는 서로를 가리지 않는다. 문장 순서는 이 겹침의 절대 좌표가 아니라 역사적 셀로판 경로를 복원하는 근거다.
 
 ---
 
@@ -318,7 +331,7 @@ T4: [ ] [ ] [C]
 
 DB에는 각 Thought의 생성 순서, Unit 참조, 분기, 상태와 근거를 원본 그대로 남긴다. `ABC / A`는 저장 형식이 아니라 현재 Z View에서 계산되는 모습이다.
 
-현재 구현은 `thoughts`, `thought_elements`, `thought_edges`에 원본 사고와 연결을 저장한다. 후속 구현에서는 같은 생성 시각에도 정확한 순서를 보장하는 단조 증가 `thoughtSequence`와 당시 footprint 근거를 추가한다.
+현재 구현은 `thoughts`, `thought_elements`, `thought_edges`에 원본 사고와 연결을 저장한다. `thoughtSequence`는 같은 생성 시각에도 append 순서를 보장하며, `thought_footprints`는 각 ThoughtElement의 직접 Unit 셀과 재귀 composition 과정에서 만나는 모든 중간·하위 Unit 셀을 원본 footprint로 보존한다.
 
 새로운 A가 생겨도 과거 A의 opacity 행을 UPDATE하지 않는다.
 
@@ -332,7 +345,7 @@ A 좌표 -> [새 A, 과거 A]
 
 ### 6.2 좌표별 국소 Z 압축
 
-Z축 깊이는 전역 Thought 번호나 경과 시간이 아니다. Y 연상 평면의 같은 좌표를 실제로 차지하는 Thought 자국만 최신순으로 모은 국소 깊이다.
+Z축 깊이는 전역 Thought 번호나 경과 시간이 아니다. 같은 Unit 셀 또는 composition을 펼쳤을 때 공유하는 하위 Unit 셀을 실제로 차지하는 Thought 자국만 최신순으로 모은 국소 깊이다.
 
 ```text
 발생 순서:
@@ -349,19 +362,31 @@ T4: [ ] [ ] [C]
 B와 C는 A의 footprint를 덮지 않았으므로 A를 아래로 밀지 않는다. 빈 공간은 Z 깊이에 포함하지 않는다.
 
 ```text
-localZDepth(coordinate, occurrence)
-  = 같은 Y 평면 좌표를 실제로 차지한 더 최신 Thought occurrence의 수
+localZDepth(unitCell, occurrence)
+  = 같은 Unit 셀 영역을 실제로 차지한 더 최신 Thought occurrence의 수
 ```
 
-부분적으로 겹치는 Unit은 교집합 좌표에서만 서로를 가린다.
+동일한 Unit은 `unitId`만으로 같은 셀임을 판정한다.
 
 ```text
-footprint(직업) = {a, b, c, d}
-footprint(직종) = {b, c, e}
+T1 -> unitId A [철수]
+T2 -> unitId A [철수]
 
-b, c 좌표: 직종 / 직업의 2층 스택
-a, d 좌표: 직업만 존재
-e 좌표: 직종만 존재
+T2의 localZDepth(A) = 0
+T1의 localZDepth(A) = 1
+```
+
+서로 다른 Unit은 composition을 재귀적으로 펼친 실제 하위 Unit 셀의 교집합으로 부분 겹침을 판정한다.
+
+```text
+identityFootprint([철수])     = {[철수]}
+compositionFootprint([철수])  = {[철], [수]}
+
+identityFootprint([철수는])    = {[철수는]}
+compositionFootprint([철수는]) = {[철], [수], [는]}
+
+공유 영역: [철], [수]
+비공유 영역: [는]
 ```
 
 ### 6.3 현재 투명도와 총 가시성
@@ -373,8 +398,26 @@ visibleOpacity
   = baseOpacity × decay(localZDepth)
 
 coordinateVisibility
-  = 같은 좌표에 쌓인 occurrence의 visibleOpacity 총합
+  = 같은 Unit 셀 영역에 쌓인 occurrence의 visibleOpacity 총합
 ```
+
+첫 구현의 `decay(localZDepth)`는 설정 가능한 비율 감쇠다. 기본값은 `0.8 ** localZDepth`다. 동일 Thought 셀로판 안에서 같은 Unit 셀이 여러 번 나타나면 같은 localZDepth를 공유하며 농도에는 각각 기여할 수 있지만 서로를 아래로 밀지는 않는다. 현재 영향력 View에서는 `conclusion`과 `alternative`만 깊이와 가시성에 참여하고, `rejected`와 `evicted`는 원본 역사와 역추적 View에만 남는다.
+
+Thought 연결을 Recall할 때는 출발 Unit 셀의 localZDepth를 그 Thought 셀로판에서 나간 연결 전체에 적용한다.
+
+```text
+T1: A -> B
+T2: A -> C
+
+A 셀의 현재 깊이:
+T2 = 0
+T1 = 1
+
+A -> C의 thoughtVisibility = edgeOpacity × 0.8 ** 0
+A -> B의 thoughtVisibility = edgeOpacity × 0.8 ** 1
+```
+
+B와 C가 서로 다른 Unit 셀이어도 같은 출발 Unit A에서 만들어진 판단이므로 A 셀의 적층 순서를 공유한다. `thoughtDensity`는 과거 사고 연결의 원시 반복 횟수로 보존하고, Recall 후보 선택과 Thought 경로 비교에는 감쇠된 `thoughtVisibility`를 별도 근거로 사용한다. 따라서 최근 한 번의 연결과 흐려진 과거 여러 연결은 가시성 총합으로 경쟁할 수 있다.
 
 가장 최근 A는 표면의 현재 활성 판단으로 보인다. 아래의 과거 A는 흐려지지만 삭제되지 않고 총 가시성에 계속 기여한다. 오래된 반복 A 여러 겹이 최신 한 겹과 비슷하거나 더 강한 존재감을 가질 수 있다.
 
@@ -383,7 +426,7 @@ coordinateVisibility
 ```text
 시간 경과                         != Z 깊이 증가
 다른 좌표의 Thought 발생          != Z 깊이 증가
-같은 Y 평면 자리에 새 자국이 겹침 == 해당 부분의 Z 깊이 증가
+같은 Unit 셀 영역에 새 자국이 겹침 == 해당 부분의 Z 깊이 증가
 ```
 
 ### 6.4 역사적 Thought와 현재 Thought 투영
@@ -682,8 +725,8 @@ Language Input
   -> recall(): X Memory Cube의 Y Side View와 영속 Z축의 현재 투영
   -> think(): Y 연상 평면 위에서 Z축 연결 / 분기 / 작업기억 감쇠
   -> 원본 Thought 셀로판 append-only 영속화
-  -> Unit의 composition/context footprint 복원
-  -> 좌표별 빈 공간 제거와 localZDepth 계산
+  -> Unit의 identity/composition footprint와 historicalContext 복원
+  -> Unit 셀별 빈 공간 제거와 localZDepth 계산
   -> 총 진함이 가장 큰 결론 구조
   -> express(): depth 왕복으로 관련 Unit과 문장 층 수집
   -> Unit position 기반 셀로판 중첩
@@ -705,22 +748,26 @@ response = engine.respond(expressionResult)
 
 ## 17. 남은 구현 세부사항
 
-현재 구현은 Thought 원본의 Unit, 연결, 분기와 상태를 `thoughts`, `thought_elements`, `thought_edges`에 영속화한다. 아직 Y-plane footprint와 좌표별 localZDepth 계산은 구현하지 않았다.
+현재 구현은 다음 범위를 포함한다.
+
+1. `thoughts`, `thought_elements`, `thought_edges`의 append-only 원본 사고
+2. 단조 증가 `thoughtSequence`
+3. `thought_footprints`의 identity 및 모든 composition 단계 Unit 셀
+4. Thought 셀로판 단위의 셀별 `localZDepth`
+5. 기본 `0.8` 비율 감쇠에 따른 `visibleOpacity`와 셀의 총 가시성
+6. 모든 상태의 역사 보존과 `conclusion`/`alternative`만의 현재 View 참여
 
 다음 구조와 값은 후속 구현에서 추가하거나 설정값으로 둔다.
 
-1. DB에서 보장하는 단조 증가 `thoughtSequence`
-2. Thought 당시 composition/context footprint의 역사적 보존 형식
-3. 현재 Unit 지식을 과거 Thought에 지연 투영하는 방법
-4. 부분적으로 겹치는 footprint의 좌표 표현
-5. `localZDepth`에 따른 투명도 감쇠 함수
-6. 한 번에 최초 활성화할 Recall Unit의 최대 개수
-7. 작업기억에서 동시에 활성화할 ThoughtElement의 최대 개수
-8. 가설 연결을 지지됨 또는 지지되지 않음으로 판단하는 최소 구조 조건
-9. Thought 구조를 거의 동일하다고 판단하는 비교 기준
-10. `branchDarkness`가 같은 가지의 동점 처리
-11. 여러 깊은 Unit에 동시에 도달할 때 후보 범위를 제한하는 방법
-12. `slotDensity`가 같은 칸의 동점 처리
-13. 표현할 수 있는 기반 문장이 발견되지 않았을 때의 대체 출력
+1. Thought 당시 `historicalContext`를 element별로 보존하는 형식
+2. 현재 Unit 지식을 과거 Thought에 지연 투영하는 방법
+3. 한 번에 최초 활성화할 Recall Unit의 최대 개수
+4. 작업기억에서 동시에 활성화할 ThoughtElement의 최대 개수
+5. 가설 연결을 지지됨 또는 지지되지 않음으로 판단하는 최소 구조 조건
+6. Thought 구조를 거의 동일하다고 판단하는 비교 기준
+7. `branchDarkness`가 같은 가지의 동점 처리
+8. 여러 깊은 Unit에 동시에 도달할 때 후보 범위를 제한하는 방법
+9. `slotDensity`가 같은 칸의 동점 처리
+10. 표현할 수 있는 기반 문장이 발견되지 않았을 때의 대체 출력
 
 이 값들은 임의의 의미 유사도 모델을 추가하기보다 실제 구조의 겹침과 역사적 연속성을 유지하는 방향으로 조정한다.

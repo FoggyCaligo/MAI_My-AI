@@ -28,6 +28,7 @@ class ThoughtConfig:
     maxThoughtSteps: int = 20
     maxBranchesPerFocus: int = 3
     stableRepeatLimit: int = 2
+    thoughtOpacityDecay: float = 0.8
 
 
 @dataclass(slots=True)
@@ -39,6 +40,7 @@ class ThoughtNode:
     position: int
     observedDensity: int
     thoughtDensity: int
+    thoughtVisibility: float
     opacity: float
     status: str = "supported"
     lastActivatedStep: int = 0
@@ -77,6 +79,9 @@ class CognitiveEngine:
         self._cell_cache: dict[str, dict[str, dict[LayerKey, float]]] = {}
         self._composition_cache: dict[str, list[CompositionCandidate]] = {}
         self.thoughtConfig = thoughtConfig or ThoughtConfig()
+        if not 0.0 < self.thoughtConfig.thoughtOpacityDecay <= 1.0:
+            raise ValueError("thoughtOpacityDecay must be greater than 0 and at most 1")
+        self._backfillThoughtFootprints()
 
     def close(self) -> None:
         self.db.close()
@@ -506,6 +511,7 @@ class CognitiveEngine:
             unitId: str,
             observedDensity: int = 0,
             thoughtDensity: int = 0,
+            thoughtVisibility: float = 0.0,
             opacity: float = 0.0,
             source: str = "observed",
         ) -> None:
@@ -517,12 +523,14 @@ class CognitiveEngine:
                     "unit_id": unitId,
                     "observed_density": 0,
                     "thought_density": 0,
+                    "thought_visibility": 0.0,
                     "opacity": 0.0,
                     "sources": set(),
                 },
             )
             item["observed_density"] += int(observedDensity)
             item["thought_density"] += int(thoughtDensity)
+            item["thought_visibility"] += float(thoughtVisibility)
             item["opacity"] += float(opacity)
             item["sources"].add(source)
 
@@ -575,24 +583,42 @@ class CognitiveEngine:
             f"""
             SELECT sourceUnit.unit_id AS source_unit_id,
                    targetUnit.unit_id AS target_unit_id,
-                   COUNT(*) AS density,
-                   SUM(te.opacity) AS opacity_sum
+                   te.opacity, t.thought_sequence
             FROM thought_edges AS te
             JOIN thought_elements AS sourceUnit
               ON sourceUnit.element_id = te.source_element_id
             JOIN thought_elements AS targetUnit
               ON targetUnit.element_id = te.target_element_id
+            JOIN thoughts AS t ON t.thought_id = te.thought_id
             WHERE sourceUnit.unit_id IN ({placeholders})
               AND te.status IN ({statusPlaceholders})
-            GROUP BY sourceUnit.unit_id, targetUnit.unit_id
+            ORDER BY sourceUnit.unit_id, t.thought_sequence DESC
             """,
             activeIds + statuses,
         ).fetchall()
+        sequencesBySource: dict[str, list[int]] = defaultdict(list)
         for row in thoughtRows:
+            sourceId = str(row["source_unit_id"])
+            thoughtSequence = int(row["thought_sequence"])
+            if thoughtSequence not in sequencesBySource[sourceId]:
+                sequencesBySource[sourceId].append(thoughtSequence)
+        depthBySourceSequence = {
+            (sourceId, sequence): depth
+            for sourceId, sequences in sequencesBySource.items()
+            for depth, sequence in enumerate(sequences)
+        }
+        for row in thoughtRows:
+            sourceId = str(row["source_unit_id"])
+            thoughtSequence = int(row["thought_sequence"])
+            localZDepth = depthBySourceSequence[(sourceId, thoughtSequence)]
+            visibleOpacity = float(row["opacity"]) * (
+                self.thoughtConfig.thoughtOpacityDecay ** localZDepth
+            )
             addEvidence(
                 str(row["target_unit_id"]),
-                thoughtDensity=int(row["density"]),
-                opacity=float(row["opacity_sum"] or 0.0),
+                thoughtDensity=1,
+                thoughtVisibility=visibleOpacity,
+                opacity=visibleOpacity,
                 source="thought",
             )
 
@@ -606,6 +632,7 @@ class CognitiveEngine:
         candidates.sort(
             key=lambda item: (
                 int(item["observed_density"]),
+                float(item["thought_visibility"]),
                 int(item["thought_density"]),
                 float(item["opacity"]),
                 int(item["depth"]),
@@ -632,25 +659,178 @@ class CognitiveEngine:
         path.reverse()
         return path
 
+    def _unitFootprint(self, unitId: str) -> dict[str, tuple[str, int]]:
+        """Return the identity cell and every Unit cell in its composition tree."""
+        footprint: dict[str, tuple[str, int]] = {unitId: ("identity", 0)}
+        frontier: list[tuple[str, int]] = [(unitId, 0)]
+        expanded: set[str] = set()
+
+        while frontier:
+            parentId, parentDistance = frontier.pop(0)
+            if parentId in expanded:
+                continue
+            expanded.add(parentId)
+            rows = self.conn.execute(
+                """
+                SELECT child_unit_id
+                FROM compositions
+                WHERE parent_unit_id = ?
+                ORDER BY position
+                """,
+                (parentId,),
+            ).fetchall()
+            for row in rows:
+                childId = str(row["child_unit_id"])
+                distance = parentDistance + 1
+                existing = footprint.get(childId)
+                if existing is None or distance < existing[1]:
+                    footprint[childId] = ("composition", distance)
+                if childId not in expanded:
+                    frontier.append((childId, distance))
+
+        return footprint
+
+    def _footprintRows(
+        self,
+        elementId: str,
+        unitId: str,
+    ) -> list[tuple[str, str, str, int]]:
+        return [
+            (elementId, footprintUnitId, kind, distance)
+            for footprintUnitId, (kind, distance) in self._unitFootprint(unitId).items()
+        ]
+
+    def _backfillThoughtFootprints(self) -> None:
+        """Materialize immutable Unit-cell footprints for older ThoughtElements."""
+        rows = self.conn.execute(
+            """
+            SELECT te.element_id, te.unit_id
+            FROM thought_elements AS te
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM thought_footprints AS tf
+                WHERE tf.element_id = te.element_id
+            )
+            """
+        ).fetchall()
+        footprintRows: list[tuple[str, str, str, int]] = []
+        for row in rows:
+            footprintRows.extend(
+                self._footprintRows(str(row["element_id"]), str(row["unit_id"]))
+            )
+        if footprintRows:
+            self.conn.executemany(
+                """
+                INSERT OR IGNORE INTO thought_footprints
+                  (element_id, footprint_unit_id, footprint_kind, composition_distance)
+                VALUES (?, ?, ?, ?)
+                """,
+                footprintRows,
+            )
+            self.conn.commit()
+
+    def getThoughtView(self) -> dict[str, Any]:
+        """Compute current Unit-cell-local depth and visibility from persistent Thoughts."""
+        rows = self.conn.execute(
+            """
+            SELECT tf.footprint_unit_id, tf.footprint_kind, tf.composition_distance,
+                   te.element_id, te.thought_id, te.unit_id, te.status, te.opacity,
+                   te.thought_position, t.thought_sequence
+            FROM thought_footprints AS tf
+            JOIN thought_elements AS te ON te.element_id = tf.element_id
+            JOIN thoughts AS t ON t.thought_id = te.thought_id
+            ORDER BY t.thought_sequence DESC, te.thought_position, te.element_id
+            """
+        ).fetchall()
+
+        byCell: dict[str, list[Any]] = defaultdict(list)
+        for row in rows:
+            byCell[str(row["footprint_unit_id"])].append(row)
+
+        activeStatuses = {"conclusion", "alternative"}
+        cells: list[dict[str, Any]] = []
+        for cellUnitId, cellRows in byCell.items():
+            activeSequences = list(
+                dict.fromkeys(
+                    int(row["thought_sequence"])
+                    for row in cellRows
+                    if str(row["status"]) in activeStatuses
+                )
+            )
+            depthBySequence = {
+                sequence: depth for depth, sequence in enumerate(activeSequences)
+            }
+            occurrences: list[dict[str, Any]] = []
+            cellVisibility = 0.0
+            for row in cellRows:
+                status = str(row["status"])
+                participates = status in activeStatuses
+                thoughtSequence = int(row["thought_sequence"])
+                localZDepth = (
+                    depthBySequence[thoughtSequence] if participates else None
+                )
+                visibleOpacity = (
+                    float(row["opacity"])
+                    * (self.thoughtConfig.thoughtOpacityDecay ** localZDepth)
+                    if localZDepth is not None
+                    else 0.0
+                )
+                cellVisibility += visibleOpacity
+                occurrences.append(
+                    {
+                        "thought_id": str(row["thought_id"]),
+                        "thought_sequence": thoughtSequence,
+                        "element_id": str(row["element_id"]),
+                        "unit_id": str(row["unit_id"]),
+                        "status": status,
+                        "footprint_kind": str(row["footprint_kind"]),
+                        "composition_distance": int(row["composition_distance"]),
+                        "local_z_depth": localZDepth,
+                        "visible_opacity": visibleOpacity,
+                        "participates_in_current_view": participates,
+                    }
+                )
+            cells.append(
+                {
+                    "unit_id": cellUnitId,
+                    "content": self.get_unit_content(cellUnitId),
+                    "visibility": cellVisibility,
+                    "occurrences": occurrences,
+                }
+            )
+
+        cells.sort(key=lambda cell: (-float(cell["visibility"]), str(cell["unit_id"])))
+        return {
+            "opacity_decay": self.thoughtConfig.thoughtOpacityDecay,
+            "cells": cells,
+        }
+
     def _persistThought(
         self,
         thoughtId: str,
         sourceSentenceId: str | None,
         nodes: dict[str, ThoughtNode],
     ) -> None:
+        nextSequence = int(
+            self.conn.execute(
+                "SELECT COALESCE(MAX(thought_sequence), 0) + 1 AS next_sequence FROM thoughts"
+            ).fetchone()["next_sequence"]
+        )
         self.conn.execute(
             """
-            INSERT INTO thoughts (thought_id, source_sentence_id, status)
-            VALUES (?, ?, 'complete')
+            INSERT INTO thoughts
+              (thought_id, thought_sequence, source_sentence_id, status)
+            VALUES (?, ?, ?, 'complete')
             """,
-            (thoughtId, sourceSentenceId),
+            (thoughtId, nextSequence, sourceSentenceId),
         )
         self.conn.executemany(
             """
             INSERT INTO thought_elements
               (element_id, thought_id, unit_id, thought_position, branch_id,
-               parent_element_id, status, observed_density, thought_density, opacity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               parent_element_id, status, observed_density, thought_density,
+               thought_visibility, opacity)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -663,10 +843,22 @@ class CognitiveEngine:
                     node.status,
                     node.observedDensity,
                     node.thoughtDensity,
+                    node.thoughtVisibility,
                     node.opacity,
                 )
                 for node in nodes.values()
             ],
+        )
+        footprintRows: list[tuple[str, str, str, int]] = []
+        for node in nodes.values():
+            footprintRows.extend(self._footprintRows(node.elementId, node.unitId))
+        self.conn.executemany(
+            """
+            INSERT INTO thought_footprints
+              (element_id, footprint_unit_id, footprint_kind, composition_distance)
+            VALUES (?, ?, ?, ?)
+            """,
+            footprintRows,
         )
         edgeRows = []
         for node in nodes.values():
@@ -681,6 +873,7 @@ class CognitiveEngine:
                     node.status,
                     node.observedDensity,
                     node.thoughtDensity,
+                    node.thoughtVisibility,
                     node.opacity,
                 )
             )
@@ -688,8 +881,8 @@ class CognitiveEngine:
             """
             INSERT INTO thought_edges
               (edge_id, thought_id, source_element_id, target_element_id, status,
-               observed_density, thought_density, opacity)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               observed_density, thought_density, thought_visibility, opacity)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             edgeRows,
         )
@@ -725,6 +918,7 @@ class CognitiveEngine:
             position=0,
             observedDensity=int(rootCandidate["observed_density"]),
             thoughtDensity=int(rootCandidate["thought_density"]),
+            thoughtVisibility=float(rootCandidate.get("thought_visibility", 0.0)),
             opacity=float(rootCandidate["opacity"]),
         )
         nodes[rootId] = root
@@ -753,6 +947,7 @@ class CognitiveEngine:
                 position=1,
                 observedDensity=int(candidate["observed_density"]),
                 thoughtDensity=int(candidate["thought_density"]),
+                thoughtVisibility=float(candidate.get("thought_visibility", 0.0)),
                 opacity=float(candidate["opacity"]),
                 status=(
                     "supported"
@@ -780,6 +975,7 @@ class CognitiveEngine:
                 unexplored,
                 key=lambda node: (
                     node.observedDensity,
+                    node.thoughtVisibility,
                     node.thoughtDensity,
                     node.opacity,
                     node.lastActivatedStep,
@@ -819,6 +1015,7 @@ class CognitiveEngine:
                     position=focus.position + 1,
                     observedDensity=int(candidate["observed_density"]),
                     thoughtDensity=int(candidate["thought_density"]),
+                    thoughtVisibility=float(candidate.get("thought_visibility", 0.0)),
                     opacity=float(candidate["opacity"]),
                     lastActivatedStep=step,
                 )
@@ -892,13 +1089,15 @@ class CognitiveEngine:
         if not eligibleLeaves:
             eligibleLeaves = [root]
 
-        def pathRank(leaf: ThoughtNode) -> tuple[int, int, int, float, int]:
+        def pathRank(leaf: ThoughtNode) -> tuple[float, int, float, int, float, int]:
             path = self._nodePath(leaf, nodes)
             observedTotal = sum(node.observedDensity for node in path)
             thoughtTotal = sum(node.thoughtDensity for node in path)
+            thoughtVisibilityTotal = sum(node.thoughtVisibility for node in path)
             return (
-                observedTotal + thoughtTotal,
+                observedTotal + thoughtVisibilityTotal,
                 observedTotal,
+                thoughtVisibilityTotal,
                 thoughtTotal,
                 sum(node.opacity for node in path),
                 len(path),
@@ -937,6 +1136,7 @@ class CognitiveEngine:
                     "status": node.status,
                     "observed_density": node.observedDensity,
                     "thought_density": node.thoughtDensity,
+                    "thought_visibility": node.thoughtVisibility,
                     "opacity": node.opacity,
                 }
                 for node in nodes.values()
