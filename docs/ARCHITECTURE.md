@@ -264,12 +264,14 @@ The core remains independent from UI or product-specific shells.
 현재 Core의 Side View는 입력과 교차하는 과거 구조에서 연상 Unit을 인출한다. 다음 단계에서는 이 인출 결과를 완성된 사고로 간주하지 않고, 세 번째 축인 Thought Space에 임시로 배치하여 사고를 전개한다.
 
 ```text
-X축: 경험 안에서 관찰된 Unit의 순서와 연결
-Y축: Unit의 합성 구조와 depth
-Z축: 현재 사고를 위해 Unit을 배치하고 전개하는 Thought Space
+X축: 구성 요소가 수평으로 연결되어 하나의 Unit을 정의하는 방향
+Y축: 만들어진 Unit이 새로운 depth에 쌓이며 관계와 맥락을 형성하는 방향
+Z축: 기억에서 선택한 Unit을 임시로 연결하며 사고를 전개하는 Thought Space
 ```
 
-Z축에 놓인 Unit의 연결과 분기 자체가 사고 경로가 된다. 현재 활성화된 일부 Unit만 작업기억으로 유지하며, 각 Unit에서 다시 X/Y 기억 공간의 Side View를 수행해 다음 Unit을 인출하고 배치한다.
+X축은 특정 문장 하나의 절대 좌표축이 아니다. 관찰된 구성 요소가 수평으로 연결되어 하나의 개념 덩어리인 Unit을 정의하는 방향이다. `position`은 전체 X축의 절대 좌표가 아니라 특정 관찰이나 Unit 구성 안의 상대적 위치다.
+
+Thought는 X축을 수정하거나 새로운 Unit 구조를 정의하지 않는다. Side View가 X/Y 기억 공간에서 선택한 완성된 Unit을 Z축에 놓고 연결·분기·비활성화한다. 그 Z축 흔적 자체가 사고 경로가 되며, 현재 활성화된 일부 Unit만 작업기억으로 유지한다.
 
 완성된 Thought를 자연어로 표현할 때는 특정 depth의 Unit을 단순 연결하지 않는다. 최종 Thought와 겹치는 과거 X/Y 언어 구조를 Expression View로 찾고, 표현 골격에 Thought Unit을 투영한 뒤 composition을 선택적으로 펼쳐 문자열로 만든다.
 
