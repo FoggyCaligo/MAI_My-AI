@@ -51,20 +51,6 @@ def run_cli() -> None:
             else:
                 print("\n[최종 생각 결과 (Side-View 연상 단어)]\n  (교차 연상된 학습 이력이 아직 없습니다)")
 
-            # 4. 피드백 점수 입력 (0~100점, 사고 레이어에만 반영)
-            if res["sentence_id"]:
-                try:
-                    fb = input("\n피드백 점수를 입력하세요 (0~100점, 엔터 = 스킵): ").strip()
-                    if fb:
-                        score = float(fb)
-                        new_op = engine.apply_feedback(res["sentence_id"], score)
-                        print(
-                            f"  [피드백 반영 완료] {score}점 → "
-                            f"사고 레이어 평균 투명도 {new_op:.3f}"
-                        )
-                except ValueError:
-                    print("  [알림] 숫자가 아닌 값이 입력되어 스킵합니다.")
-
     finally:
         engine.close()
 

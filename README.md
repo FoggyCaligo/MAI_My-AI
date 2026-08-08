@@ -1,29 +1,39 @@
 # MAI (My AI)
 
-MAI is an experimental personal AI architecture project based on a recursive cellophane overlap model, side-view cross-sectional thinking, and 0~100 score opacity feedback.
+MAI는 llm을 대체하기 위한, 새로운 개념의 AI 구조 입니다.
 
-## Features
 
-- **Recursive Multi-Depth Unit Engine (`core/`)**:
-  - Automatically segments sentences from characters (`depth 0`) into words (`depth 1`), meanings (`depth 2`), and concepts (`depth N`).
-  - Recurses until the entire input sentence merges into a single Unit or reaches maximum layering.
-- **Pure Graph Database (`mai_core.db`)**:
-  - Stores `units`, `compositions`, and `unit_links` with `sentence_id` lineage and `opacity` weights.
-- **Side-View Thinking**:
-  - Explores cross-sectional intersections of past sentence layers at `depth >= 2` to generate associative thoughts.
-- **0~100 Score Opacity Feedback**:
-  - Adjusts cellophane layer opacity for thought units (`depth >= 2`), effectively suppressing high-frequency particles or wrong associations upon negative feedback.
 
-## Getting Started
+## 구조
 
-Run the interactive CLI:
+- **재귀적 다중 depth Unit 엔진 (`core/`)**
+  - 입력에서 반복되는 구조를 발견하여 기존 Unit을 더 큰 Unit으로 재귀적으로 합성합니다.
+  - depth는 단어·의미·개념처럼 고정된 언어 계층이 아니라 Unit이 형성된 구조적 높이입니다.
+- **셀로판 구조 저장소 (`mai_core.db`)**
+  - `units`, `compositions`, `cell_elements`에 Unit의 정체성, 합성 구조, 관찰된 연결과 역사적 좌표를 저장합니다.
+- **Side View 기반 연상**
+  - 현재 입력과 교차하는 과거 문장 층과 상위 Unit을 탐색하여 관련 기억을 인출합니다.
+- **0~100점 opacity 피드백**
+  - 고차원 기억 연결의 장기 가중치를 조절하며, 실제 CellElement 겹침 개수인 density와는 구분합니다.
+- **Thought Space와 Expression View 설계**
+  - 인출된 기억을 세 번째 축에서 임시로 전개하고, 완성된 사고를 과거 언어 구조로 자연어화하는 다음 단계를 설계하고 있습니다.
+
+## 실행
+
+대화형 CLI를 실행합니다.
 
 ```bash
 python -m app.main
 ```
 
-Or:
+또는 다음과 같이 실행합니다.
 
 ```bash
 python app/cli.py
 ```
+
+## 문서
+
+- [현재 아키텍처](./docs/ARCHITECTURE.md)
+- [셀로판 저장과 활성 투영](./docs/CELLOPHANE_STORAGE.md)
+- [사고 공간과 자연어 표현 설계](./docs/THOUGHT_SPACE.md)
