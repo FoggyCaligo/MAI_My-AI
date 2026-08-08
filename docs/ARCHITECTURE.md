@@ -261,19 +261,19 @@ The core remains independent from UI or product-specific shells.
 
 ## 11. 다음 단계: Thought Space와 자연어 표현
 
-현재 Core의 Side View는 입력과 교차하는 과거 구조에서 연상 Unit을 인출한다. 다음 단계에서는 이 인출 결과를 완성된 사고로 간주하지 않고, 세 번째 축인 Thought Space에 임시로 배치하여 사고를 전개한다.
+현재 Core의 Side View는 입력과 교차하는 과거 구조에서 연상 Unit을 인출한다. 다음 단계에서는 이 인출 결과를 완성된 사고로 간주하지 않고, 세 번째 축인 Thought Space에 배치하여 사고를 전개한다.
 
 ```text
 X축: 구성 요소가 수평으로 연결되어 하나의 Unit을 정의하는 방향
 Y축: 만들어진 Unit이 새로운 depth에 쌓이며 관계와 맥락을 형성하는 방향
-Z축: 기억에서 선택한 Unit을 임시로 연결하며 사고를 전개하는 Thought Space
+Z축: 기억에서 선택한 Unit을 연결하고 사고 흔적을 누적하는 Thought Space
 ```
 
 X축은 특정 문장 하나의 절대 좌표축이 아니다. 관찰된 구성 요소가 수평으로 연결되어 하나의 개념 덩어리인 Unit을 정의하는 방향이다. `position`은 전체 X축의 절대 좌표가 아니라 특정 관찰이나 Unit 구성 안의 상대적 위치다.
 
-Thought는 X축을 수정하거나 새로운 Unit 구조를 정의하지 않는다. Side View가 X/Y 기억 공간에서 선택한 완성된 Unit을 Z축에 놓고 연결·분기·비활성화한다. 그 Z축 흔적 자체가 사고 경로가 되며, 현재 활성화된 일부 Unit만 작업기억으로 유지한다.
+Thought는 X축을 수정하거나 새로운 Unit 구조를 정의하지 않는다. Side View가 X/Y 기억 공간에서 선택한 완성된 Unit을 Z축에 놓고 연결·분기·감쇠한다. 그 Z축 흔적 자체가 영속적인 사고 기억이 되며 이후 Side View에서 다시 활성화될 수 있다. 외부 관찰인 X/Y 기억과 자체 사고인 Z축 기억은 출처를 구분한다.
 
-완성된 Thought를 자연어로 표현할 때는 특정 depth의 Unit을 단순 연결하지 않는다. 최종 Thought와 겹치는 과거 X/Y 언어 구조를 Expression View로 찾고, 표현 골격에 Thought Unit을 투영한 뒤 composition을 선택적으로 펼쳐 문자열로 만든다.
+완성된 Thought를 자연어로 표현할 때는 특정 depth의 Unit을 단순 연결하지 않는다. 결론 Unit에서 더 깊고 뭉뚱그려진 Unit을 거쳐 같은 depth의 관련 Unit을 찾고, 그 Unit들이 실제로 나타난 `sentenceId + passId` 층을 수집한다. 문장은 문자 길이가 아닌 Unit position별로 겹치며, 가장 진한 골격의 대응 칸들을 현재 결론 Unit으로 교체해 문자열을 만든다.
 
 ```text
 Memory -> Recall -> Thought -> Expression -> Natural Language
