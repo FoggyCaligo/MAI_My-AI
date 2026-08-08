@@ -15,9 +15,10 @@ MAI는 llm을 대체하기 위한, 새로운 개념의 AI 구조 입니다.
   - 현재 입력과 교차하는 과거 문장 층과 상위 Unit을 탐색하여 관련 기억을 인출합니다.
 - **0~100점 opacity 피드백**
   - 고차원 기억 연결의 장기 가중치를 조절하며, 실제 CellElement 겹침 개수인 density와는 구분합니다.
-- **Thought Space와 Expression View 설계**
+- **Thought Space와 Expression View**
   - 인출된 Unit을 세 번째 축에서 전개하고 사고 흔적을 영속적으로 누적합니다.
-  - 최종 결론 Unit에 맞는 과거 문장 층을 Unit position별로 겹쳐 자연어 표현 골격을 찾는 다음 단계를 설계하고 있습니다.
+  - 최종 결론 Unit에 맞는 과거 문장 층을 Unit position별로 겹쳐 자연어 표현 골격을 찾습니다.
+  - 현재 구현은 구조를 검증하기 위한 첫 번째 실험 버전입니다.
 
 ## 실행
 

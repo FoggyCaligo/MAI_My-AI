@@ -1,3 +1,3 @@
-from .engine import CognitiveEngine
+from .engine import CognitiveEngine, ThoughtConfig
 
-__all__ = ["CognitiveEngine"]
+__all__ = ["CognitiveEngine", "ThoughtConfig"]

@@ -259,9 +259,9 @@ The core remains independent from UI or product-specific shells.
 
 ---
 
-## 11. 다음 단계: Thought Space와 자연어 표현
+## 11. Thought Space와 자연어 표현
 
-현재 Core의 Side View는 입력과 교차하는 과거 구조에서 연상 Unit을 인출한다. 다음 단계에서는 이 인출 결과를 완성된 사고로 간주하지 않고, 세 번째 축인 Thought Space에 배치하여 사고를 전개한다.
+Core의 `recall()`은 입력과 교차하는 과거 구조에서 연상 Unit과 근거를 인출한다. `think()`는 이 인출 결과를 완성된 사고로 간주하지 않고 세 번째 축인 Thought Space에 배치하여 사고를 전개한다.
 
 ```text
 X축: 구성 요소가 수평으로 연결되어 하나의 Unit을 정의하는 방향
@@ -279,4 +279,4 @@ Thought는 X축을 수정하거나 새로운 Unit 구조를 정의하지 않는�
 Memory -> Recall -> Thought -> Expression -> Natural Language
 ```
 
-Thought Space와 Expression View의 상세 설계, 초기 구현 범위, 미결정 정책은 [THOUGHT_SPACE.md](./THOUGHT_SPACE.md)에 정리한다. 이 부분은 현재 구현이 아니라 다음 단계의 설계안이다.
+Thought Space와 Expression View의 상세 설계, 현재 구현 범위, 남은 조정 항목은 [THOUGHT_SPACE.md](./THOUGHT_SPACE.md)에 정리한다.

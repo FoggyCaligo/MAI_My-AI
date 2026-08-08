@@ -51,6 +51,16 @@ def run_cli() -> None:
             else:
                 print("\n[최종 생각 결과 (Side-View 연상 단어)]\n  (교차 연상된 학습 이력이 아직 없습니다)")
 
+            conclusionContents = [
+                engine.get_unit_content(unitId)
+                for unitId in res["thought_result"]["conclusion_unit_ids"]
+            ]
+            if conclusionContents:
+                print(f"\n[Z축 결론 구조]\n  {' -> '.join(conclusionContents)}")
+
+            if res["response"]:
+                print(f"\n[자연어 응답]\n  {res['response']}")
+
     finally:
         engine.close()
 

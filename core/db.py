@@ -54,6 +54,70 @@ ON cell_elements (link_depth);
 
 CREATE INDEX IF NOT EXISTS idx_cell_elements_source_sentence
 ON cell_elements (source_unit_id, sentence_id);
+
+-- Exact Unit slots of every observed sentence/pass layer. Unlike an edge-only
+-- representation, this also preserves single-Unit layers for Expression View.
+CREATE TABLE IF NOT EXISTS observed_layer_units (
+    sentence_id TEXT NOT NULL,
+    pass_id INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    unit_id TEXT NOT NULL,
+    PRIMARY KEY (sentence_id, pass_id, position),
+    FOREIGN KEY (unit_id) REFERENCES units(unit_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_observed_layer_units_unit
+ON observed_layer_units (unit_id, sentence_id, pass_id);
+
+CREATE TABLE IF NOT EXISTS thoughts (
+    thought_id TEXT PRIMARY KEY,
+    source_sentence_id TEXT,
+    status TEXT NOT NULL DEFAULT 'complete',
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_thoughts_source_sentence
+ON thoughts (source_sentence_id);
+
+CREATE TABLE IF NOT EXISTS thought_elements (
+    element_id TEXT PRIMARY KEY,
+    thought_id TEXT NOT NULL,
+    unit_id TEXT NOT NULL,
+    thought_position INTEGER NOT NULL,
+    branch_id TEXT NOT NULL,
+    parent_element_id TEXT,
+    status TEXT NOT NULL,
+    observed_density INTEGER NOT NULL DEFAULT 0,
+    thought_density INTEGER NOT NULL DEFAULT 0,
+    opacity REAL NOT NULL DEFAULT 1.0,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (thought_id) REFERENCES thoughts(thought_id),
+    FOREIGN KEY (unit_id) REFERENCES units(unit_id),
+    FOREIGN KEY (parent_element_id) REFERENCES thought_elements(element_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_thought_elements_thought
+ON thought_elements (thought_id, thought_position);
+
+CREATE INDEX IF NOT EXISTS idx_thought_elements_unit_status
+ON thought_elements (unit_id, status);
+
+CREATE TABLE IF NOT EXISTS thought_edges (
+    edge_id TEXT PRIMARY KEY,
+    thought_id TEXT NOT NULL,
+    source_element_id TEXT NOT NULL,
+    target_element_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    observed_density INTEGER NOT NULL DEFAULT 0,
+    thought_density INTEGER NOT NULL DEFAULT 0,
+    opacity REAL NOT NULL DEFAULT 1.0,
+    FOREIGN KEY (thought_id) REFERENCES thoughts(thought_id),
+    FOREIGN KEY (source_element_id) REFERENCES thought_elements(element_id),
+    FOREIGN KEY (target_element_id) REFERENCES thought_elements(element_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_thought_edges_thought
+ON thought_edges (thought_id);
 """
 
 
@@ -70,6 +134,7 @@ class Database:
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
         self._migrate_legacy_unit_links()
+        self._migrate_observed_layer_units()
         self.conn.commit()
 
     def _table_exists(self, table_name: str) -> bool:
@@ -126,6 +191,32 @@ class Database:
                   AND ce.sentence_id = ul.sentence_id
                   AND ce.position = ul.position
                   AND ce.pass_id = {pass_expr}
+            )
+            """
+        )
+
+    def _migrate_observed_layer_units(self) -> None:
+        """Reconstruct missing observed Unit slots from existing CellElements."""
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO observed_layer_units
+              (sentence_id, pass_id, position, unit_id)
+            SELECT sentence_id, pass_id, position, source_unit_id
+            FROM cell_elements
+            """
+        )
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO observed_layer_units
+              (sentence_id, pass_id, position, unit_id)
+            SELECT ce.sentence_id, ce.pass_id, ce.position + 1, ce.next_unit_id
+            FROM cell_elements AS ce
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM cell_elements AS later
+                WHERE later.sentence_id = ce.sentence_id
+                  AND later.pass_id = ce.pass_id
+                  AND later.position = ce.position + 1
             )
             """
         )
