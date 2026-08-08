@@ -2,10 +2,12 @@
 
 ## 1. 문서의 목적
 
-현재 MAI Core는 다음 두 기능을 구현하고 있다.
+현재 MAI Core는 다음 기능의 첫 버전을 구현하고 있다.
 
 1. 관찰된 문장을 재사용 가능한 Unit과 CellElement로 누적한다.
 2. 현재 입력과 교차하는 과거 구조를 Side View로 찾아 연상 Unit을 인출한다.
+3. 연상 Unit을 Z축에서 연결·분기하고 전체 사고 흔적을 상태와 함께 영속화한다.
+4. 결론 Unit과 과거 문장 층을 Unit position으로 겹쳐 자연어 표현을 만든다.
 
 기존 `_think_side_view()`가 반환하던 결과는 완성된 사고라기보다 **기억의 인출과 연상**에 가까웠다. 이 문서는 인출된 Unit을 Z축에서 전개하여 생각을 만들고, 그 생각을 다시 자연어로 표현하는 개념 모델과 첫 구현의 동작을 정의한다.
 
@@ -13,57 +15,101 @@ Thought Space와 Expression View의 첫 구현은 `core/engine.py`와 `core/db.p
 
 ---
 
-## 2. 세 축의 정의
+## 2. X Memory Cube, Y Association Plane, Z Thought Stack
 
-Unit은 어느 한 축이 아니라 모든 축에서 재사용하는 기본 정체성이다.
-
-```text
-X축: 구성 요소가 수평으로 연결되어 하나의 Unit을 정의하는 방향
-Y축: 만들어진 Unit이 새로운 depth에 쌓이며 관계와 맥락을 형성하는 방향
-Z축: 기억에서 선택한 Unit을 연결하고 그 사고 흔적을 누적하는 방향
-```
-
-### 2.1 X축: 개념 덩어리의 정의
-
-X축은 특정 문장 하나의 절대 좌표축이 아니다. 여러 구성 요소가 수평으로 연결되어 **하나의 개념 덩어리인 Unit을 정의하는 구조적 방향**이다.
-
-과거 관찰에서는 구성 요소의 순서가 X축 위에 나타난다.
+X, Y, Z는 단순한 세 개의 숫자 좌표가 아니다. X는 영속적인 기억 큐브이고, Y는 현재 입력으로 X를 잘라 옆에서 본 연상 평면이며, Z는 그 Y 평면을 재료로 사고 셀로판을 쌓는 공간이다.
 
 ```text
-[비] -> [가] -> [온다]
+X Memory Cube
+  = Unit position × List/depth × observation Time
+
+Y Side Association Plane
+  = 현재 입력의 활성 Unit을 포함한 셀로판 전체를 골라,
+    Unit 길이를 유지한 채 겹쳐 본 연상 단면
+
+Z Thought Stack
+  = Y 연상 평면 위에 영속적으로 쌓이는 사고 셀로판
 ```
 
-반복되는 구조가 하나의 Unit으로 형성되면 그 Unit의 구성도 X축 방향을 가진다.
+### 2.1 X Memory Cube
+
+문자를 하나의 거대한 평면 테이블로만 보지 않는다. 한 입력을 재귀 처리하면서 표현 단계마다 별도의 Unit 리스트를 만든다.
 
 ```text
-[비] + [가] + [온다] = [비가 온다]
+                 Unit position ->
+List 0    [엄] [마] [는] [집] [에] [있] [다]
+List 1    [엄마] [는] [집] [에] [있다]
+List 2    [엄마는] [집에 있다]
+List 3    [엄마는 집에 있다]
+  |
+  v
+recursive List
 ```
 
-현재 구현에서 `cell_elements`는 과거 관찰에서 수평 연결이 나타난 순서를 보존하고, `compositions`는 상위 Unit 안에서 자식 Unit이 놓인 순서를 보존한다.
+`List 1 = 단어`, `List 2 = 개념`처럼 의미 계층을 고정하지 않는다. 각 List는 한 입력을 재귀적으로 처리하면서 실제로 만들어진 Unit 배열이다.
 
-`position`은 전체 기억 공간의 절대 X좌표가 아니다. 특정 관찰이나 Unit 구성 안에서 한 요소가 차지했던 상대적 위치다. Thought는 이 X축 구조를 수정하거나 새 Unit을 정의하지 않는다.
-
-### 2.2 Y축: depth의 누적
-
-Y축은 X축 구조로 정의된 Unit이 다시 하나의 구성 요소로 사용되면서 새로운 depth에 쌓이는 방향이다. 이 누적을 통해 Unit 간 관계와 맥락을 더 높은 구조에서 해석할 수 있다.
+이 2차원 `Unit position × List/depth` 셀로판이 새로운 입력마다 observation Time 방향으로 쌓여 하나의 큰 기억 큐브를 만든다.
 
 ```text
-[비] + [가] + [온다]
-          ↓
-      [비가 온다]
+                       observation Time
+                              ↑
+                 +-------------------------+
+입력 T3          | Unit position × List    |
+                 +-------------------------+
+입력 T2          | Unit position × List    |
+                 +-------------------------+
+입력 T1          | Unit position × List    |
+                 +-------------------------+
 ```
 
-현재 구현에서는 `compositions`가 각 depth에서 만들어진 부모 Unit과 자식 Unit의 관계를 보존한다. Unit의 depth는 다음 규칙을 따른다.
+X Memory Cube 안에서 반복되는 위치와 연결은 실제 CellElement 겹침만큼 진해진다. 반복 구조가 발견되면 다른 색상의 상위 Unit을 새 주소로 추가하고, 그 Unit 배열을 다음 List로 다시 입력한다.
 
 ```text
-new_depth = max(child.depth) + 1
+[엄] + [마] -> [엄마]
+[엄마] + [는] -> [엄마는]
 ```
 
-따라서 depth는 단어, 의미, 개념 같은 고정 언어 계층이 아니며 일반적인 연관관계 점수도 아니다. Unit이 형성된 구조적 높이다.
+기존 문자, 낮은 List, 과거 입력 셀로판은 삭제하거나 다시 쓰지 않는다. `cell_elements`는 관찰된 연결을, `observed_layer_units`는 각 `sentenceId + passId` List의 정확한 Unit 칸을, `compositions`는 Unit의 재귀 구성을 보존한다.
 
-### 2.3 Z축: 사고의 연결과 전개
+### 2.2 List/depth 축
 
-Z축은 Side View가 X/Y 기억 공간에서 선택한 완성된 Unit을 꺼내어 연결하고 사고를 전개하는 방향이다. Z축에 사용되는 Unit의 X축 구성과 Y축 depth는 그대로 유지된다.
+Memory Cube에서 List와 depth는 별도의 공간축으로 취급하지 않는다. 하나의 List는 한 입력을 재귀 처리해서 얻은 하나의 depth 층이며, 다음 List는 그 결과를 다시 입력해 만든 다음 depth 층이다.
+
+```text
+List/depth 0  [엄] [마] [는] [집] [에] [있] [다]
+List/depth 1  [엄마] [는] [집] [에] [있다]
+List/depth 2  [엄마는] [집에 있다]
+```
+
+DB의 `unit.depth`는 Unit이 자식 Unit으로부터 합성된 구조적 높이를 기록하는 생성 이력이다. 현재 구현에서 이 값이 `passId`와 항상 같지는 않더라도, Memory Cube에 `unit.depth`라는 별도의 공간 방향을 추가하지 않는다. 공간에서 사용하는 층 좌표는 `sentenceId + passId`, 즉 해당 입력의 List/depth 층이다.
+
+### 2.3 Y Side Association Plane
+
+새 입력이 들어오면 그 입력의 각 List/depth에서 현재 활성 Unit을 얻는다. 그 활성 Unit을 하나라도 포함한 과거 입력 셀로판만 X Memory Cube에서 선택한다. 활성 Unit만 잘라내는 것이 아니라, 선택된 셀로판의 전체 Unit List를 투영 대상으로 삼는다. 그래야 활성 Unit과 함께 관찰되었던 다른 Unit들이 연상으로 나타난다.
+
+```text
+현재 입력의 List/depth별 활성 Unit
+  -> 활성 Unit을 포함한 observation Time 셀로판 선택
+  -> 선택된 셀로판의 전체 Unit List 유지
+  -> List/depth 방향에서 바라보되 Unit 길이와 시간 두께를 유지해 투영
+  -> Y Side Association Plane 생성
+```
+
+따라서 Y 평면은 짧은 점선이 쌓인 면이 아니라, Unit 순서를 보존한 긴 선들이 observation Time 방향으로 겹쳐 두께를 이루는 면이다. Unit 방향을 정면으로 바라봐 각 List를 점으로 축약해서는 안 된다.
+
+```text
+선택된 T3  [철수] [는] [등산]   [을] [좋아한다]
+선택된 T1  [철수] [는] [개발자] [다]
+              ^ 선택 기준       ^ 함께 드러난 연상
+```
+
+셀로판 선택은 활성 Unit을 기준으로 하지만, Y 평면 투영은 선택된 셀로판 전체를 포함한다. Y는 별도 의미 유사도 계산 공간이 아니라 X Memory Cube에서 현재 입력과 관련된 기억만 골라 만든 측면 연상 평면이다.
+
+역사적 Side View는 당시 저장된 List와 Unit을 보여주고, 활성 Side View는 현재 알려진 Unit을 과거 구조에 지연 투영한 결과를 보여준다.
+
+### 2.4 Z Thought Stack
+
+Y Side Association Plane에서 일부 Unit을 작업기억에 올리고, 그 연상 평면 위에 Thought 셀로판을 쌓으며 연결·분기·비교한다.
 
 ```text
 [엄마]
@@ -73,15 +119,12 @@ Z축은 Side View가 X/Y 기억 공간에서 선택한 완성된 Unit을 꺼내�
    └─ [당일 복귀] -> [저녁 귀가]
 ```
 
-위 화살표와 분기는 X축 연결이 아니라 Z축의 사고 연결이다. 여러 기억에서 인출된 Unit을 이어 보고, 분기하고, 비교한 흔적이다.
-
-Z축은 단순한 시간 로그가 아니다. 시간적 순서는 사고 구조를 복원하기 위한 좌표로 존재할 수 있지만, 축의 본질은 **현재 활성화된 기억을 배치하고 전개하는 공간**이다.
-
-Thought가 X축을 수정하지 않는다는 것은 중요한 경계다.
+Z축의 연결은 X Memory Cube의 Unit이나 과거 기억을 수정하지 않는다. Y 연상 평면을 재료로 실제로 거쳐 간 사고의 흔적이며, 완성된 Thought 셀로판은 append-only로 영속 저장된다.
 
 ```text
-X/Y 공간: 외부 관찰로 형성된 기억과 Unit의 정의
-Z 공간  : 정의된 Unit을 사용해 실제로 전개한 사고의 기억
+X Memory Cube       : Unit position × List/depth × observation Time
+Y Association Plane : 활성 Unit을 포함한 셀로판 전체의 긴 Unit 선을 겹친 Side View
+Z Thought Stack     : Y 평면 위에 쌓이는 영속 사고 기억
 ```
 
 ---
@@ -92,17 +135,19 @@ MAI의 기억과 사고는 다음 단계로 구분한다.
 
 ```text
 Memory
-  X축으로 정의되고 Y축 depth에 누적된 Unit 구조가 장기적으로 존재한다.
+  X Memory Cube에 Unit position × List/depth 셀로판이
+  observation Time 방향으로 영속 누적된다.
 
 Recall
-  현재 입력을 기준으로 Side View를 수행하여 관련 Unit을 인출한다.
+  현재 입력의 List/depth별 활성 Unit을 포함한 셀로판 전체를 선택하고
+  Y Side Association Plane에서 관련 Unit을 인출한다.
 
 Thought
-  인출된 Unit을 Z축에 배치하고,
+  인출된 Unit을 Y 연상 평면 위 Z Thought Stack에 배치하고,
   기존 Unit 구조를 변경하지 않은 채 연결, 분기, 비교, 제거를 반복한다.
 ```
 
-Side View는 Thought 자체가 아니다. Side View는 현재 초점과 교차하는 기억을 찾아 Z축에 놓을 후보를 제공하는 탐색 방법이다.
+Y Side Association Plane은 Thought 자체가 아니다. 현재 초점과 교차하는 X Memory Cube의 기억을 찾아 Z축에 놓을 후보와 그 연상 평면을 제공한다.
 
 ```text
 입력 Unit 활성화
@@ -173,7 +218,19 @@ ThoughtElement
 - 현재 활성 상태인가
 ```
 
-`ThoughtElement`는 새로운 의미 Unit이 아니다. 한 사고 과정에서 기존 Unit이 활성화된 위치를 나타내는 Z축 요소다. Thought가 끝난 뒤에도 사고 흔적으로 남을 수 있지만, 참조하는 Unit의 X/Y 구조를 변경하지 않는다.
+`ThoughtElement`는 새로운 의미 Unit이 아니다. 한 사고 과정에서 기존 Unit이 활성화된 위치를 나타내는 Z축 요소다. Thought가 끝난 뒤에도 사고 흔적으로 남을 수 있지만, 참조하는 X Memory Cube의 Unit 구조를 변경하지 않는다.
+
+각 ThoughtElement는 참조하는 Unit을 통해 Y 연상 평면에 구조적 자국을 가진다.
+
+```text
+compositionFootprint
+  Unit 자체가 어떤 하위 Unit과 위치로 구성됐는가
+
+contextFootprint
+  과거 sentenceId + passId 층에서 어떤 주변 Unit과 함께 있었는가
+```
+
+Z View는 Unit을 점 하나로만 보지 않는다. 두 Unit의 Y-plane footprint가 일부만 겹치면 겹친 부분에서만 Z층이 형성되고, 나머지 부분은 서로를 가리지 않는다. composition과 context의 겹침은 출처를 구분하여 보존한다.
 
 ---
 
@@ -189,23 +246,22 @@ Working Memory
   현재 Thought에서 활성화되어 탐색과 비교에 사용되는 일부
 ```
 
-사고가 한 단계 진행될 때마다 이전 ThoughtElement는 희미해진다. 새로운 Unit이 들어오면 현재 작업기억에서 가장 오래된 사고를 먼저 제외한다.
+작업기억에서는 새로운 Unit이 들어올 때 가장 오래된 활성 요소를 먼저 제외할 수 있다. 그러나 이 작업기억 감쇠를 영속 Z View의 투명도와 동일시하지 않는다.
 
 ```text
 새 ThoughtElement 추가
-  -> 기존 활성 요소 감쇠
   -> 가장 오래된 활성 요소를 작업기억에서 제외
   -> 제외된 요소는 Z축 흔적에 계속 보존
 ```
 
-작업기억에서 제외된 요소는 삭제되지 않으며 이후 Z축 Side View를 통해 다시 활성화될 수 있다.
+작업기억에서 제외된 요소는 삭제되지 않으며 이후 Z View를 통해 역추적할 수 있다. 일반 Recall에 다시 기여할 수 있는지는 저장 상태에 따라 결정한다.
 
 ```text
 density
-  X/Y 기억에서 실제로 겹친 CellElement의 개수
+  X Memory Cube에서 실제로 겹친 CellElement의 개수
 
 opacity
-  피드백에 따라 조정되는 X/Y 기억의 지속적 가중치
+  피드백에 따라 조정되는 X Memory Cube 기억의 지속적 가중치
 
 activation
   현재 Thought의 작업기억에서 유지되는 활성 상태 또는 강도
@@ -214,17 +270,17 @@ thoughtDensity
   과거 Z축에서 같은 사고 구조가 반복되고 활성화된 실제 겹침
 ```
 
-X/Y 기억과 Z축 사고는 모두 영속하지만 출처를 구분한다.
+X Memory Cube와 Z Thought Stack은 모두 영속하지만 출처를 구분한다.
 
 ```text
 observedMemory
-  외부 관찰로 형성된 X/Y 근거
+  외부 관찰로 X Memory Cube에 쌓인 근거
 
 thoughtMemory
   MAI가 과거에 전개한 Z축 사고 근거
 ```
 
-Z축은 이후 Side View의 인출 대상이 될 수 있다. 반복된 사고 경로가 다시 활성화되면서 사고 습관, 관념, 성격이 형성될 가능성을 남긴다. 그러나 Z축 사고를 외부 관찰과 동일한 사실로 취급하거나 X/Y 기억으로 자동 승격하지 않는다.
+Z축은 이후 Side View의 인출 대상이 될 수 있다. 반복된 사고 경로가 다시 활성화되면서 사고 습관, 관념, 성격이 형성될 가능성을 남긴다. 그러나 Z축 사고를 외부 관찰과 동일한 사실로 취급하거나 X Memory Cube의 관찰 기억으로 자동 승격하지 않는다.
 
 Thought가 끝나면 역추적을 위해 탐색된 모든 Z축 가지를 상태와 함께 저장한다.
 
@@ -248,6 +304,102 @@ evicted
 
 따라서 저장 여부와 이후 사고에 영향을 줄 수 있는 활성 자격은 서로 다른 개념이다.
 
+### 6.1 원본 Thought의 append-only 영속성
+
+Thought가 끝나면 완성된 사고 셀로판을 기존 Z 기록 위에 새로 추가한다. 과거 Thought를 덮어쓰거나 미리 압축하지 않는다.
+
+```text
+실제 저장:
+T1: [A] [ ] [ ]
+T2: [ ] [B] [ ]
+T3: [A] [ ] [ ]
+T4: [ ] [ ] [C]
+```
+
+DB에는 각 Thought의 생성 순서, Unit 참조, 분기, 상태와 근거를 원본 그대로 남긴다. `ABC / A`는 저장 형식이 아니라 현재 Z View에서 계산되는 모습이다.
+
+현재 구현은 `thoughts`, `thought_elements`, `thought_edges`에 원본 사고와 연결을 저장한다. 후속 구현에서는 같은 생성 시각에도 정확한 순서를 보장하는 단조 증가 `thoughtSequence`와 당시 footprint 근거를 추가한다.
+
+새로운 A가 생겨도 과거 A의 opacity 행을 UPDATE하지 않는다.
+
+```text
+새 A 저장 전:
+A 좌표 -> [과거 A]
+
+새 A 저장 후:
+A 좌표 -> [새 A, 과거 A]
+```
+
+### 6.2 좌표별 국소 Z 압축
+
+Z축 깊이는 전역 Thought 번호나 경과 시간이 아니다. Y 연상 평면의 같은 좌표를 실제로 차지하는 Thought 자국만 최신순으로 모은 국소 깊이다.
+
+```text
+발생 순서:
+T1: [A] [ ] [ ]
+T2: [ ] [B] [ ]
+T3: [A] [ ] [ ]
+T4: [ ] [ ] [C]
+
+현재 Z View:
+[A] [B] [C]
+[A]
+```
+
+B와 C는 A의 footprint를 덮지 않았으므로 A를 아래로 밀지 않는다. 빈 공간은 Z 깊이에 포함하지 않는다.
+
+```text
+localZDepth(coordinate, occurrence)
+  = 같은 Y 평면 좌표를 실제로 차지한 더 최신 Thought occurrence의 수
+```
+
+부분적으로 겹치는 Unit은 교집합 좌표에서만 서로를 가린다.
+
+```text
+footprint(직업) = {a, b, c, d}
+footprint(직종) = {b, c, e}
+
+b, c 좌표: 직종 / 직업의 2층 스택
+a, d 좌표: 직업만 존재
+e 좌표: 직종만 존재
+```
+
+### 6.3 현재 투명도와 총 가시성
+
+각 좌표의 현재 투명도는 원본에 저장된 고정된 나이가 아니라 조회 시 계산한 `localZDepth`에서 나온다.
+
+```text
+visibleOpacity
+  = baseOpacity × decay(localZDepth)
+
+coordinateVisibility
+  = 같은 좌표에 쌓인 occurrence의 visibleOpacity 총합
+```
+
+가장 최근 A는 표면의 현재 활성 판단으로 보인다. 아래의 과거 A는 흐려지지만 삭제되지 않고 총 가시성에 계속 기여한다. 오래된 반복 A 여러 겹이 최신 한 겹과 비슷하거나 더 강한 존재감을 가질 수 있다.
+
+시간이 흘렀거나 서로 겹치지 않는 다른 Thought가 생겼다는 이유만으로 과거 자국을 흐리게 하지 않는다.
+
+```text
+시간 경과                         != Z 깊이 증가
+다른 좌표의 Thought 발생          != Z 깊이 증가
+같은 Y 평면 자리에 새 자국이 겹침 == 해당 부분의 Z 깊이 증가
+```
+
+### 6.4 역사적 Thought와 현재 Thought 투영
+
+과거 Thought가 실제로 사용한 Unit과 자국은 변경하지 않는다. 이후 새로운 상위 Unit을 학습하면 현재 지식으로 과거 Thought를 지연 투영할 수 있다.
+
+```text
+historicalThought
+  당시 실제로 어떤 Unit과 footprint로 생각했는가
+
+activeThoughtProjection
+  현재 알려진 Unit으로 그 과거 Thought를 보면 무엇이 겹쳐 보이는가
+```
+
+이는 X Memory Cube의 역사적 관찰과 활성 투영을 분리한 기존 원칙을 Z축에도 동일하게 적용한 것이다.
+
 ---
 
 ## 7. 구조적 depth와 사고 위치
@@ -259,10 +411,13 @@ unitDepth
   Unit이 자식으로부터 합성된 구조적 높이
 
 thoughtPosition
-  현재 사고가 전개되면서 해당 Unit 출현이 놓인 Z축 위치
+  하나의 Thought 내부에서 해당 Unit 출현이 놓인 전개 위치
+
+localZDepth
+  현재 Z View에서 같은 Y 평면 좌표에 실제로 겹친 occurrence의 국소 순서
 ```
 
-depth 0인 Unit이 Z축의 먼 위치에서 다시 나타날 수 있고, 높은 depth의 Unit이 최초 사고 위치에서 활성화될 수도 있다. 두 값을 하나의 depth로 합치지 않는다.
+Unit depth, Thought 내부 전개 위치, 좌표별 localZDepth를 하나의 값으로 합치지 않는다.
 
 ---
 
@@ -306,7 +461,7 @@ Side View에서 인출된 Unit 중 가장 진한 Unit을 최초 초점으로 사
   -> 충분히 희미해지면 작업기억에서 제외
 ```
 
-가설 연결은 X/Y 기억을 수정하지 않는다. Z축에는 실제로 거쳐 간 사고 흔적으로 남되, 지지를 얻은 연결과 얻지 못한 연결의 상태를 구분한다.
+가설 연결은 X Memory Cube의 관찰 기억을 수정하지 않는다. Z축에는 실제로 거쳐 간 사고 흔적으로 남되, 지지를 얻은 연결과 얻지 못한 연결의 상태를 구분한다.
 
 ### 8.4 다음 초점
 
@@ -349,7 +504,7 @@ Side View에서 인출된 Unit 중 가장 진한 Unit을 최초 초점으로 사
 
 ```text
 branchDarkness
-  = 해당 가지를 구성하는 Unit과 연결에서 살아남은 진함의 총합
+  = 해당 가지의 footprint가 Z View에서 차지하는 좌표별 총 가시성
 ```
 
 개별 Unit 하나가 가장 진한 가지가 아니라 **가지 전체의 총합이 가장 진한 구조**를 최종 결론 구조로 선택한다. 동점 처리의 세부 규칙은 구현 단계에서 확정한다.
@@ -524,8 +679,11 @@ slotDensity(결론 Unit, position)
 ```text
 Language Input
   -> Unit 활성화
-  -> recall(): X/Y와 영속 Z축의 Side View
-  -> think(): Z축 연결 / 분기 / 감쇠 / 영속화
+  -> recall(): X Memory Cube의 Y Side View와 영속 Z축의 현재 투영
+  -> think(): Y 연상 평면 위에서 Z축 연결 / 분기 / 작업기억 감쇠
+  -> 원본 Thought 셀로판 append-only 영속화
+  -> Unit의 composition/context footprint 복원
+  -> 좌표별 빈 공간 제거와 localZDepth 계산
   -> 총 진함이 가장 큰 결론 구조
   -> express(): depth 왕복으로 관련 Unit과 문장 층 수집
   -> Unit position 기반 셀로판 중첩
@@ -547,16 +705,22 @@ response = engine.respond(expressionResult)
 
 ## 17. 남은 구현 세부사항
 
-핵심 방향은 확정되었으며 다음 값과 동점 처리 규칙은 구현 단계에서 결정하거나 설정값으로 둔다.
+현재 구현은 Thought 원본의 Unit, 연결, 분기와 상태를 `thoughts`, `thought_elements`, `thought_edges`에 영속화한다. 아직 Y-plane footprint와 좌표별 localZDepth 계산은 구현하지 않았다.
 
-1. 한 번에 최초 활성화할 Recall Unit의 최대 개수
-2. activation의 단계별 감쇠량
-3. 작업기억에서 동시에 활성화할 ThoughtElement의 최대 개수
-4. 가설 연결을 지지됨 또는 지지되지 않음으로 판단하는 최소 구조 조건
-5. Thought 구조를 거의 동일하다고 판단하는 비교 기준
-6. `branchDarkness`가 같은 가지의 동점 처리
-7. 여러 깊은 Unit에 동시에 도달할 때 후보 범위를 제한하는 방법
-8. `slotDensity`가 같은 칸의 동점 처리
-9. 표현할 수 있는 기반 문장이 발견되지 않았을 때의 대체 출력
+다음 구조와 값은 후속 구현에서 추가하거나 설정값으로 둔다.
+
+1. DB에서 보장하는 단조 증가 `thoughtSequence`
+2. Thought 당시 composition/context footprint의 역사적 보존 형식
+3. 현재 Unit 지식을 과거 Thought에 지연 투영하는 방법
+4. 부분적으로 겹치는 footprint의 좌표 표현
+5. `localZDepth`에 따른 투명도 감쇠 함수
+6. 한 번에 최초 활성화할 Recall Unit의 최대 개수
+7. 작업기억에서 동시에 활성화할 ThoughtElement의 최대 개수
+8. 가설 연결을 지지됨 또는 지지되지 않음으로 판단하는 최소 구조 조건
+9. Thought 구조를 거의 동일하다고 판단하는 비교 기준
+10. `branchDarkness`가 같은 가지의 동점 처리
+11. 여러 깊은 Unit에 동시에 도달할 때 후보 범위를 제한하는 방법
+12. `slotDensity`가 같은 칸의 동점 처리
+13. 표현할 수 있는 기반 문장이 발견되지 않았을 때의 대체 출력
 
 이 값들은 임의의 의미 유사도 모델을 추가하기보다 실제 구조의 겹침과 역사적 연속성을 유지하는 방향으로 조정한다.

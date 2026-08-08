@@ -264,14 +264,38 @@ The core remains independent from UI or product-specific shells.
 Core의 `recall()`은 입력과 교차하는 과거 구조에서 연상 Unit과 근거를 인출한다. `think()`는 이 인출 결과를 완성된 사고로 간주하지 않고 세 번째 축인 Thought Space에 배치하여 사고를 전개한다.
 
 ```text
-X축: 구성 요소가 수평으로 연결되어 하나의 Unit을 정의하는 방향
-Y축: 만들어진 Unit이 새로운 depth에 쌓이며 관계와 맥락을 형성하는 방향
-Z축: 기억에서 선택한 Unit을 연결하고 사고 흔적을 누적하는 Thought Space
+X Memory Cube
+  = Unit position × List/depth × observation Time
+
+Y Side Association Plane
+  = 활성 Unit을 포함한 셀로판 전체를 골라
+    Unit 길이를 유지한 채 겹쳐 본 연상 단면
+
+Z Thought Stack
+  = Y 연상 평면 위에 영속적으로 쌓이는 사고 셀로판
 ```
 
-X축은 특정 문장 하나의 절대 좌표축이 아니다. 관찰된 구성 요소가 수평으로 연결되어 하나의 개념 덩어리인 Unit을 정의하는 방향이다. `position`은 전체 X축의 절대 좌표가 아니라 특정 관찰이나 Unit 구성 안의 상대적 위치다.
+한 입력은 재귀 처리 단계마다 별도의 Unit List를 만든다. 이 문서의 공간 모델에서 List와 depth는 별도 축이 아니다. 하나의 List가 하나의 재귀 depth 층이며, `Unit position × List/depth`로 이루어진 한 장의 입력 셀로판이 observation Time 방향으로 누적되면서 X Memory Cube가 된다. DB의 `unit.depth`는 Unit의 생성 이력이므로 현재 구현상 `passId`와 항상 같지는 않지만, 별도의 공간축으로 사용하지 않는다.
 
-Thought는 X축을 수정하거나 새로운 Unit 구조를 정의하지 않는다. Side View가 X/Y 기억 공간에서 선택한 완성된 Unit을 Z축에 놓고 연결·분기·감쇠한다. 그 Z축 흔적 자체가 영속적인 사고 기억이 되며 이후 Side View에서 다시 활성화될 수 있다. 외부 관찰인 X/Y 기억과 자체 사고인 Z축 기억은 출처를 구분한다.
+새 입력의 각 List/depth에서 활성화된 Unit을 하나라도 포함하는 과거 입력 셀로판을 선택한다. 이후 활성 Unit만 잘라내지 않고 선택된 셀로판의 전체 Unit List를 투영한다. 이때 Unit 방향을 정면으로 보아 짧은 점선으로 축약하지 않고, Unit 순서가 보존된 긴 선들이 observation Time 방향으로 겹치도록 List/depth 방향에서 바라본 결과가 Y Side Association Plane이다. 선택 기준이 된 Unit과 함께 셀로판에 있던 다른 Unit들이 이 면에서 즉각적인 연상으로 드러난다.
+
+Thought는 X Memory Cube의 관찰 기억이나 Unit 구조를 수정하지 않는다. Y 연상 평면에서 선택한 Unit을 Z축에 놓고 연결·분기하며, 완성된 원본 Thought 셀로판을 append-only로 영속 저장한다. 외부 관찰 기억과 자체 사고 기억은 출처를 구분한다.
+
+현재 Z View는 저장된 Thought를 그대로 시간 간격으로 세지 않는다. 각 Thought Unit이 Y 연상 평면에 남긴 footprint를 복원하고, 같은 Y 좌표를 실제로 차지한 occurrence만 최신순으로 빈칸 없이 압축한다. 서로 겹치지 않는 Thought는 과거 자국의 투명도를 낮추지 않으며, 부분적으로 겹치는 Unit은 교집합 좌표에서만 Z층을 만든다.
+
+```text
+저장:
+T1: [A] [ ] [ ]
+T2: [ ] [B] [ ]
+T3: [A] [ ] [ ]
+T4: [ ] [ ] [C]
+
+현재 Z View:
+[A] [B] [C]
+[A]
+```
+
+가장 최근 A는 표면의 현재 활성 판단으로 보이고, 아래의 과거 A는 흐려져도 총 가시성에 계속 기여한다. DB에는 원본 사고 순서와 footprint를 보존하고, localZDepth와 visibleOpacity는 조회 시 계산한다.
 
 완성된 Thought를 자연어로 표현할 때는 특정 depth의 Unit을 단순 연결하지 않는다. 결론 Unit에서 더 깊고 뭉뚱그려진 Unit을 거쳐 같은 depth의 관련 Unit을 찾고, 그 Unit들이 실제로 나타난 `sentenceId + passId` 층을 수집한다. 문장은 문자 길이가 아닌 Unit position별로 겹치며, 가장 진한 골격의 대응 칸들을 현재 결론 Unit으로 교체해 문자열을 만든다.
 
